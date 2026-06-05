@@ -107,9 +107,12 @@ func (s *Service) processPendingPayloadAttestation(ctx context.Context, root [32
 }
 
 func (s *Service) prunePendingPayloadAttestations() {
-	currentSlot := s.cfg.clock.CurrentSlot()
 	s.pendingPayloadAttestationLock.Lock()
 	defer s.pendingPayloadAttestationLock.Unlock()
+	if len(s.pendingPayloadAttestations) == 0 {
+		return
+	}
+	currentSlot := s.cfg.clock.CurrentSlot()
 	for root, atts := range s.pendingPayloadAttestations {
 		if len(atts) == 0 || atts[0].Data == nil || atts[0].Data.Slot < currentSlot {
 			delete(s.pendingPayloadAttestations, root)
