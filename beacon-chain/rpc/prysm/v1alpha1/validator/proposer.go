@@ -284,10 +284,16 @@ func (vs *Server) BuildBlockParallel(ctx context.Context, sBlk interfaces.Signed
 			}
 		} else {
 			selfBuildOnly := local.OverrideBuilder || skipMevBoost
-			selfBuildEnvelope, err = vs.setExecutionPayloadBid(ctx, sBlk, local, selfBuildOnly)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "Could not set execution data for Gloas: %v", err)
+			var builderBid *ethpb.SignedExecutionPayloadBid
+			if !selfBuildOnly {
+				builderBid = vs.getBuilderExecutionPayloadBid(ctx, sBlk, head, local)
 			}
+			src, bidErr := vs.setExecutionPayloadBid(ctx, sBlk, local, builderBid, selfBuildOnly)
+			if bidErr != nil {
+				return nil, status.Errorf(codes.Internal, "Could not set execution data for Gloas: %v", bidErr)
+			}
+			vs.recordBidSource(sBlk.Block().Slot(), src)
+			selfBuildEnvelope = src == bidSourceSelfBuild
 		}
 	}
 
@@ -378,6 +384,11 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
 	}
 	if err := <-errChan; err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not broadcast/receive block: %v", err)
+	}
+
+	// Submit to the builder so it reveals the envelope when its bid won.
+	if block.Version() >= version.Gloas && vs.bidSourceForSlot(block.Block().Slot()) == bidSourceBuilderAPI {
+		go vs.submitBlockToBuilder(block)
 	}
 
 	return &ethpb.ProposeResponse{BlockRoot: root[:]}, nil

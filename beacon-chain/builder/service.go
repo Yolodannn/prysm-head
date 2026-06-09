@@ -27,6 +27,9 @@ type BlockBuilder interface {
 	SubmitBlindedBlock(ctx context.Context, block interfaces.ReadOnlySignedBeaconBlock) (interfaces.ExecutionData, v1.BlobsBundler, error)
 	SubmitBlindedBlockPostFulu(ctx context.Context, block interfaces.ReadOnlySignedBeaconBlock) error
 	GetHeader(ctx context.Context, slot primitives.Slot, parentHash [32]byte, pubKey [48]byte) (builder.SignedBid, error)
+	GetExecutionPayloadBid(ctx context.Context, slot primitives.Slot, parentHash, parentRoot [32]byte, proposerPubkey [48]byte, auth *ethpb.SignedRequestAuthV1) (*ethpb.SignedExecutionPayloadBid, error)
+	SubmitSignedBeaconBlock(ctx context.Context, block interfaces.ReadOnlySignedBeaconBlock) error
+	SubmitBuilderPreferences(ctx context.Context, validatorPubkey [48]byte, req *ethpb.BuilderPreferencesRequestV1) error
 	RegisterValidator(ctx context.Context, reg []*ethpb.SignedValidatorRegistrationV1) error
 	RegistrationByValidatorID(ctx context.Context, id primitives.ValidatorIndex) (*ethpb.ValidatorRegistrationV1, error)
 	Configured() bool
@@ -116,6 +119,46 @@ func (s *Service) SubmitBlindedBlockPostFulu(ctx context.Context, b interfaces.R
 	}
 
 	return s.c.SubmitBlindedBlockPostFulu(ctx, b)
+}
+
+// GetExecutionPayloadBid requests a SignedExecutionPayloadBid from the builder for the given slot.
+func (s *Service) GetExecutionPayloadBid(ctx context.Context, slot primitives.Slot, parentHash, parentRoot [32]byte, proposerPubkey [48]byte, auth *ethpb.SignedRequestAuthV1) (*ethpb.SignedExecutionPayloadBid, error) {
+	ctx, span := trace.StartSpan(ctx, "builder.GetExecutionPayloadBid")
+	defer span.End()
+	if s.c == nil {
+		tracing.AnnotateError(span, ErrNoBuilder)
+		return nil, ErrNoBuilder
+	}
+	bid, err := s.c.GetExecutionPayloadBid(ctx, slot, parentHash, parentRoot, proposerPubkey, auth)
+	tracing.AnnotateError(span, err)
+	return bid, err
+}
+
+// SubmitSignedBeaconBlock sends a signed Gloas beacon block to the builder so it can reveal the envelope.
+func (s *Service) SubmitSignedBeaconBlock(ctx context.Context, b interfaces.ReadOnlySignedBeaconBlock) error {
+	ctx, span := trace.StartSpan(ctx, "builder.SubmitSignedBeaconBlock")
+	defer span.End()
+	if s.c == nil {
+		tracing.AnnotateError(span, ErrNoBuilder)
+		return ErrNoBuilder
+	}
+	return s.c.SubmitSignedBeaconBlock(ctx, b)
+}
+
+// SubmitBuilderPreferences submits a proposer's per-builder preferences ahead of the bid request.
+func (s *Service) SubmitBuilderPreferences(ctx context.Context, validatorPubkey [48]byte, req *ethpb.BuilderPreferencesRequestV1) error {
+	ctx, span := trace.StartSpan(ctx, "builder.SubmitBuilderPreferences")
+	defer span.End()
+	if s.c == nil {
+		tracing.AnnotateError(span, ErrNoBuilder)
+		return ErrNoBuilder
+	}
+	// Auths are signed per builder URL; skip ones meant for a builder we don't talk to.
+	if url := string(req.GetAuth().GetMessage().GetBuilderUrl()); url != s.c.NodeURL() {
+		log.WithField("authUrl", url).WithField("builderUrl", s.c.NodeURL()).Debug("Skipping builder preferences signed for a different builder")
+		return nil
+	}
+	return s.c.SubmitBuilderPreferences(ctx, validatorPubkey, req)
 }
 
 // GetHeader retrieves the header for a given slot and parent hash from the builder relay network.

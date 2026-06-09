@@ -723,6 +723,26 @@ func (mr *MockBeaconNodeValidatorClientMockRecorder) SubmitSignedProposerPrefere
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SubmitSignedProposerPreferences", reflect.TypeOf((*MockBeaconNodeValidatorClient)(nil).SubmitSignedProposerPreferences), varargs...)
 }
 
+// SubmitBuilderPreferences mocks base method.
+func (m *MockBeaconNodeValidatorClient) SubmitBuilderPreferences(arg0 context.Context, arg1 *eth.SubmitBuilderPreferencesRequest, arg2 ...grpc.CallOption) (*emptypb.Empty, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "SubmitBuilderPreferences", varargs...)
+	ret0, _ := ret[0].(*emptypb.Empty)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// SubmitBuilderPreferences indicates an expected call of SubmitBuilderPreferences.
+func (mr *MockBeaconNodeValidatorClientMockRecorder) SubmitBuilderPreferences(arg0, arg1 any, arg2 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SubmitBuilderPreferences", reflect.TypeOf((*MockBeaconNodeValidatorClient)(nil).SubmitBuilderPreferences), varargs...)
+}
+
 // SubmitSignedExecutionPayloadBid mocks base method.
 func (m *MockBeaconNodeValidatorClient) SubmitSignedExecutionPayloadBid(arg0 context.Context, arg1 *eth.SignedExecutionPayloadBid, arg2 ...grpc.CallOption) (*emptypb.Empty, error) {
 	m.ctrl.T.Helper()

@@ -158,6 +158,8 @@ type ValidatorClient interface {
 	// proposal slots. This replaces PrepareBeaconProposer and SubmitValidatorRegistrations
 	// for Gloas+.
 	SubmitSignedProposerPreferences(ctx context.Context, in *ethpb.SubmitSignedProposerPreferencesRequest) (*empty.Empty, error)
+	// SubmitBuilderPreferences forwards builder preferences to the configured builder for Gloas+.
+	SubmitBuilderPreferences(ctx context.Context, in *ethpb.SubmitBuilderPreferencesRequest) (*empty.Empty, error)
 	SubmitSignedExecutionPayloadBid(ctx context.Context, in *ethpb.SignedExecutionPayloadBid) (*empty.Empty, error)
 	StartEventStream(ctx context.Context, topics []string, eventsChannel chan<- *event.Event)
 	EventStreamIsRunning() bool
