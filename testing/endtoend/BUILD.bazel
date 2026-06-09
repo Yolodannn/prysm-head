@@ -286,3 +286,34 @@ go_test(
     ],
     deps = common_deps,
 )
+
+go_test(
+    name = "go_minimal_sync_participation_test",
+    size = "large",
+    testonly = True,
+    srcs = [
+        "component_handler_test.go",
+        "endtoend_setup_test.go",
+        "endtoend_test.go",
+        "minimal_sync_participation_e2e_test.go",
+    ],
+    args = ["-test.v"],
+    data = [
+        "//:prysm_sh",
+        "//cmd/beacon-chain",
+        "//cmd/validator",
+        "//config/params:custom_configs",
+        "//tools/bootnode",
+        "@com_github_ethereum_go_ethereum//cmd/geth",
+        "@web3signer",
+    ],
+    eth_network = "minimal",
+    shard_count = 2,
+    tags = [
+        "e2e",
+        "manual",
+        "minimal",
+        "requires-network",
+    ],
+    deps = common_deps,
+)
