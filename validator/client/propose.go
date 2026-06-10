@@ -4,6 +4,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/OffchainLabs/prysm/v7/async"
@@ -14,12 +15,14 @@ import (
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	vtypes "github.com/OffchainLabs/prysm/v7/consensus-types/validator"
 	"github.com/OffchainLabs/prysm/v7/crypto/bls"
 	"github.com/OffchainLabs/prysm/v7/crypto/rand"
 	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
+	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
 	"github.com/OffchainLabs/prysm/v7/runtime/version"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 	"github.com/OffchainLabs/prysm/v7/validator/client/iface"
@@ -36,6 +39,8 @@ const (
 	signExitErr             = "could not sign voluntary exit proposal"
 	failedBlockSignLocalErr = "block rejected by local protection"
 )
+
+var experimentStartupLogOnce sync.Once
 
 // ProposeBlock proposes a new beacon block for a given slot. This method collects the
 // previous beacon block, any pending deposits, and ETH1 data from the beacon
@@ -168,6 +173,21 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
 		}
 	}
 
+	proposerIndex := blk.Block().ProposerIndex()
+	// EXPERIMENT: proposer delay attack hook. Local devnet only.
+	totalValidators, err := v.experimentTotalValidators(ctx)
+	if err != nil {
+		log.WithError(err).Error("EXPERIMENT: could not determine validator count for proposer delay hook")
+	} else {
+		experimentStartupLogOnce.Do(func() {
+			log.Info(experiment.StartupLog(totalValidators))
+		})
+	}
+	if err == nil && experiment.IsMaliciousValidator(uint64(proposerIndex), totalValidators) {
+		log.Infof("[ATTACK] Delaying malicious proposer block: slot=%d validator_index=%d delay=4s", slot, proposerIndex)
+		time.Sleep(experiment.ExperimentDelay)
+	}
+
 	blkResp, err := v.validatorClient.ProposeBeaconBlock(ctx, genericSignedBlock)
 	if err != nil {
 		log.WithField("slot", slot).WithError(err).Error("Failed to propose block")
@@ -195,6 +215,31 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
 	if v.emitAccountMetrics {
 		ValidatorProposeSuccessVec.WithLabelValues(fmtKey).Inc()
 	}
+}
+
+func (v *validator) experimentTotalValidators(ctx context.Context) (uint64, error) {
+	if v.prysmChainClient == nil {
+		return 0, errors.New("prysm chain client is nil")
+	}
+	counts, err := v.prysmChainClient.ValidatorCount(ctx, "", []vtypes.Status{
+		vtypes.PendingInitialized,
+		vtypes.PendingQueued,
+		vtypes.ActiveOngoing,
+		vtypes.ActiveExiting,
+		vtypes.ActiveSlashed,
+		vtypes.ExitedUnslashed,
+		vtypes.ExitedSlashed,
+		vtypes.WithdrawalPossible,
+		vtypes.WithdrawalDone,
+	})
+	if err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, count := range counts {
+		total += count.Count
+	}
+	return total, nil
 }
 
 func logProposedBlock(log *logrus.Entry, blk interfaces.SignedBeaconBlock, blkRoot []byte) error {

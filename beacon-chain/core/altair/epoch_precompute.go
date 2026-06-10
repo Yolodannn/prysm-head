@@ -235,6 +235,7 @@ func ProcessRewardsAndPenaltiesPrecompute(
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get attestation delta")
 	}
+	writeExperimentRewardCSV(beaconState, vals, attDeltas)
 
 	balances := beaconState.Balances()
 	for i := range numOfVals {
