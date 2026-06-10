@@ -3,6 +3,8 @@ package altair
 import (
 	"encoding/csv"
 	"os"
+
+	"github.com/OffchainLabs/prysm/v7/io/file"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -23,7 +25,7 @@ var experimentRewardStartupLogOnce sync.Once
 // the Altair-style reward precompute path used by Altair and later forks.
 func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*precompute.Validator, deltas []*AttDelta) {
 	if len(vals) != len(deltas) {
-		log.WithFields(map[string]interface{}{
+		log.WithFields(map[string]any{
 			"validators": len(vals),
 			"deltas":     len(deltas),
 		}).Error("EXPERIMENT: reward CSV skipped because validator and delta lengths differ")
@@ -36,7 +38,7 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 		log.Info(experiment.StartupLog(totalValidators))
 	})
 
-	if err := os.MkdirAll(filepath.Dir(experimentRewardCSVPath), 0755); err != nil {
+	if err := file.MkdirAll(filepath.Dir(experimentRewardCSVPath)); err != nil {
 		log.WithError(err).Error("EXPERIMENT: could not create reward CSV directory")
 		return
 	}
@@ -99,7 +101,7 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 		return
 	}
 
-	log.WithFields(map[string]interface{}{
+	log.WithFields(map[string]any{
 		"path":  experimentRewardCSVPath,
 		"epoch": epoch,
 		"rows":  rows,
