@@ -3,6 +3,7 @@ package altair
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/epoch/precompute"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/helpers"
@@ -22,6 +23,21 @@ type AttDelta struct {
 	TargetReward      uint64
 	TargetPenalty     uint64
 	InactivityPenalty uint64
+}
+
+var experimentRewardCSVWriteMu sync.Mutex
+var experimentRewardCSVWrittenEpochs = make(map[uint64]struct{})
+
+func shouldWriteExperimentRewardCSV(epoch uint64) bool {
+	experimentRewardCSVWriteMu.Lock()
+	defer experimentRewardCSVWriteMu.Unlock()
+
+	if _, ok := experimentRewardCSVWrittenEpochs[epoch]; ok {
+		return false
+	}
+
+	experimentRewardCSVWrittenEpochs[epoch] = struct{}{}
+	return true
 }
 
 // InitializePrecomputeValidators precomputes individual validator for its attested balances and the total sum of validators attested balances of the epoch.
@@ -235,7 +251,10 @@ func ProcessRewardsAndPenaltiesPrecompute(
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get attestation delta")
 	}
-	writeExperimentRewardCSV(beaconState, vals, attDeltas)
+	rewardEpoch := uint64(time.PrevEpoch(beaconState))
+	if shouldWriteExperimentRewardCSV(rewardEpoch) {
+		writeExperimentRewardCSV(beaconState, vals, attDeltas)
+	}
 
 	balances := beaconState.Balances()
 	for i := range numOfVals {

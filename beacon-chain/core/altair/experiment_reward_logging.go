@@ -24,6 +24,10 @@ var experimentRewardStartupLogOnce sync.Once
 // Local devnet only. This logs previous-epoch attestation reward components from
 // the Altair-style reward precompute path used by Altair and later forks.
 func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*precompute.Validator, deltas []*AttDelta) {
+	if os.Getenv("EXPERIMENT_WRITE_REWARDS") != "1" {
+		return
+	}
+
 	if len(vals) != len(deltas) {
 		log.WithFields(map[string]any{
 			"validators": len(vals),
@@ -33,7 +37,6 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 	}
 
 	totalValidators := uint64(beaconState.NumValidators())
-	maliciousCut := experiment.MaliciousValidatorCut(totalValidators)
 	experimentRewardStartupLogOnce.Do(func() {
 		log.Info(experiment.StartupLog(totalValidators))
 	})
@@ -82,7 +85,7 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 		if err := w.Write([]string{
 			strconv.FormatUint(uint64(epoch), 10),
 			strconv.FormatUint(uint64(idx), 10),
-			strconv.FormatBool(uint64(idx) < maliciousCut),
+			strconv.FormatBool(uint64(idx)%3 == 1),
 			experiment.MaliciousFractionString(),
 			strconv.FormatUint(delta.SourceReward, 10),
 			strconv.FormatUint(delta.TargetReward, 10),
