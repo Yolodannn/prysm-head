@@ -3,6 +3,7 @@ load("@prysm//tools/go:def.bzl", "go_library", "go_test")
 go_library(
     name = "go_default_library",
     srcs = [
+        "experiment_private_blocks.go",
         "aggregate.go",
         "aggregator_selector.go",
         "attest.go",

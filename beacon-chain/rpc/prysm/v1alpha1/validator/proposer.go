@@ -27,6 +27,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
 	enginev1 "github.com/OffchainLabs/prysm/v7/proto/engine/v1"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
 	"github.com/OffchainLabs/prysm/v7/runtime/version"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 	"github.com/ethereum/go-ethereum/common"
@@ -473,7 +474,44 @@ func (vs *Server) handleUnblindedBlock(
 
 // broadcastReceiveBlock broadcasts a block and handles its reception.
 func (vs *Server) broadcastReceiveBlock(ctx context.Context, wg *sync.WaitGroup, block interfaces.SignedBeaconBlock, root [fieldparams.RootLength]byte) error {
-	if err := vs.broadcastBlock(ctx, wg, block, root); err != nil {
+	defer wg.Done()
+
+	slot := block.Block().Slot()
+	proposerIndex := uint64(block.Block().ProposerIndex())
+	attackActive := uint64(slots.ToEpoch(slot)) >= experiment.ExperimentAttackStartEpoch
+	maliciousProposer := experiment.IsMaliciousValidator(proposerIndex, 0)
+
+	if false && maliciousProposer && attackActive {
+		// EXPERIMENT: Byzantine proposer releases block to its own beacon node first.
+		// This updates local fork choice before the block is broadcast to peers.
+		if err := vs.BlockReceiver.ReceiveBlock(ctx, block, root, nil); err != nil {
+			return errors.Wrap(err, "receive block")
+		}
+
+		vs.BlockNotifier.BlockFeed().Send(&feed.Event{
+			Type: blockfeed.ReceivedBlock,
+			Data: &blockfeed.ReceivedBlockData{SignedBlock: block},
+		})
+
+		log.Infof("[ATTACK] Beacon-side release done; delaying block broadcast: slot=%d proposer_index=%d delay=%s", slot, proposerIndex, experiment.ExperimentDelay)
+
+		time.Sleep(experiment.ExperimentDelay)
+
+		broadcastCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := vs.broadcastBlock(broadcastCtx, block, root); err != nil {
+			log.WithError(err).Errorf("[ATTACK] Delayed block broadcast failed: slot=%d proposer_index=%d", slot, proposerIndex)
+			return errors.Wrap(err, "broadcast block")
+		}
+
+		log.Infof("[ATTACK] Delayed block broadcast succeeded: slot=%d proposer_index=%d", slot, proposerIndex)
+
+		return nil
+	}
+
+	// Default Prysm behavior for honest proposers: broadcast first, then receive locally.
+	if err := vs.broadcastBlock(ctx, block, root); err != nil {
 		return errors.Wrap(err, "broadcast block")
 	}
 
@@ -489,20 +527,19 @@ func (vs *Server) broadcastReceiveBlock(ctx context.Context, wg *sync.WaitGroup,
 	return nil
 }
 
-func (vs *Server) broadcastBlock(ctx context.Context, wg *sync.WaitGroup, block interfaces.SignedBeaconBlock, root [fieldparams.RootLength]byte) error {
-	defer wg.Done()
-
+func (vs *Server) broadcastBlock(ctx context.Context, block interfaces.SignedBeaconBlock, root [fieldparams.RootLength]byte) error {
 	protoBlock, err := block.Proto()
 	if err != nil {
-		return errors.Wrap(err, "protobuf conversion failed")
+		return errors.Wrap(err, "block proto")
 	}
+
 	if err := vs.P2P.Broadcast(ctx, protoBlock); err != nil {
-		return errors.Wrap(err, "broadcast failed")
+		return errors.Wrap(err, "p2p broadcast")
 	}
 
 	log.WithFields(logrus.Fields{
-		"slot": block.Block().Slot(),
-		"root": fmt.Sprintf("%#x", root),
+		"blockRoot": fmt.Sprintf("%#x", root),
+		"slot":      block.Block().Slot(),
 	}).Debug("Broadcasted block")
 
 	return nil

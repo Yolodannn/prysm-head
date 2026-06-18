@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,11 +19,13 @@ import (
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
+	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
 	prysmTime "github.com/OffchainLabs/prysm/v7/time"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 	"github.com/OffchainLabs/prysm/v7/validator/client/iface"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 )
 
 var failedAttLocalProtectionErr = "attempted to make slashable attestation, rejected by local slashing protection"
@@ -70,6 +73,10 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 		return
 	}
 
+	if !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
+		return
+	}
+
 	postElectra := slots.ToEpoch(slot) >= params.BeaconConfig().ElectraForkEpoch
 
 	data, err := v.getAttestationData(ctx, slot, duty.CommitteeIndex)
@@ -80,6 +87,23 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 		}
 		tracing.AnnotateError(span, err)
 		return
+	}
+
+	usedPrivateHead := false
+	privateHeadReleaseTime := time.Time{}
+	if experimentIsByzantineRole() {
+		if privateRoot, releaseTime, ok := experimentLookupPrivateBlock(slot); ok {
+			cloned, ok := proto.Clone(data).(*ethpb.AttestationData)
+			if ok {
+				data = cloned
+			}
+			oldRoot := slices.Clone(data.BeaconBlockRoot)
+			data.BeaconBlockRoot = slices.Clone(privateRoot[:])
+			usedPrivateHead = true
+			privateHeadReleaseTime = releaseTime
+			log.Infof("[EXPERIMENT] Byzantine attester using private head before signing: slot=%d validator_index=%d old_head=%#x private_head=%#x release_unix_millis=%d",
+				slot, duty.ValidatorIndex, oldRoot, privateRoot, releaseTime.UnixMilli())
+		}
 	}
 
 	sig, _, err := v.signAtt(ctx, pubKey, data, slot)
@@ -125,6 +149,28 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 		).Debug("Attempted slashable attestation details")
 		tracing.AnnotateError(span, err)
 		return
+	}
+
+	if usedPrivateHead {
+		waitUntil := privateHeadReleaseTime.Add(500 * time.Millisecond)
+		if wait := time.Until(waitUntil); wait > 0 {
+			log.Infof("[EXPERIMENT] Byzantine attester waiting for public block release before submit: slot=%d validator_index=%d wait=%s release_unix_millis=%d",
+				slot, duty.ValidatorIndex, wait, privateHeadReleaseTime.UnixMilli())
+			timer := time.NewTimer(wait)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				log.WithError(ctx.Err()).Error("Context canceled before submitting private-head attestation")
+				tracing.AnnotateError(span, ctx.Err())
+				return
+			}
+		}
 	}
 
 	var aggregationBitfield bitfield.Bitlist

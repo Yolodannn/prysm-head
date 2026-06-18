@@ -63,6 +63,20 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
 	span.SetAttributes(trace.StringAttribute("validator", fmtKey))
 	log := log.WithField("pubkey", fmt.Sprintf("%#x", bytesutil.Trunc(pubKey[:])))
 
+	// EXPERIMENT: role filter before requesting/building a block.
+	proposerDuty, err := v.duty(pubKey)
+	if err != nil {
+		log.WithError(err).Error("EXPERIMENT: could not fetch validator assignment for proposer role filter")
+		if v.emitAccountMetrics {
+			ValidatorProposeFailVec.WithLabelValues(fmtKey).Inc()
+		}
+		return
+	}
+	if !experiment.ShouldRunValidatorDuty(uint64(proposerDuty.ValidatorIndex)) {
+		log.Infof("[EXPERIMENT] Skipping proposer duty before block build due to role filter: slot=%d validator_index=%d", slot, proposerDuty.ValidatorIndex)
+		return
+	}
+
 	// Sign randao reveal, it's used to request block from beacon node
 	epoch := primitives.Epoch(slot / params.BeaconConfig().SlotsPerEpoch)
 	randaoReveal, err := v.signRandaoReveal(ctx, pubKey, epoch, slot)
@@ -174,6 +188,10 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
 	}
 
 	proposerIndex := blk.Block().ProposerIndex()
+	if !experiment.ShouldRunValidatorDuty(uint64(proposerIndex)) {
+		log.Infof("[EXPERIMENT] Skipping proposer duty due to role filter: slot=%d validator_index=%d", slot, proposerIndex)
+		return
+	}
 	// EXPERIMENT: proposer delay attack hook. Local devnet only.
 	totalValidators, err := v.experimentTotalValidators(ctx)
 	if err != nil {
@@ -183,9 +201,37 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
 			log.Info(experiment.StartupLog(totalValidators))
 		})
 	}
-	if err == nil && experiment.IsMaliciousValidator(uint64(proposerIndex), totalValidators) {
-		log.Infof("[ATTACK] Delaying malicious proposer block: slot=%d validator_index=%d delay=4s", slot, proposerIndex)
-		time.Sleep(experiment.ExperimentDelay)
+
+	if experimentIsByzantineRole() &&
+		experiment.IsMaliciousValidator(uint64(proposerIndex), 0) &&
+		uint64(slots.ToEpoch(slot)) >= experiment.ExperimentAttackStartEpoch {
+		blockRoot, rootErr := blk.Block().HashTreeRoot()
+		if rootErr != nil {
+			log.WithError(rootErr).Errorf("[EXPERIMENT] Could not compute private block root: slot=%d proposer_index=%d", slot, proposerIndex)
+		} else {
+			releaseTime := time.Now().Add(experiment.ExperimentDelay)
+			if err := experimentRecordPrivateBlock(slot, blockRoot, releaseTime); err != nil {
+				log.WithError(err).Errorf("[EXPERIMENT] Could not record private block: slot=%d proposer_index=%d", slot, proposerIndex)
+			} else {
+				log.Infof("[EXPERIMENT] Byzantine private release recorded: slot=%d proposer_index=%d block_root=%#x delay=%s release_unix_millis=%d",
+					slot, proposerIndex, blockRoot, experiment.ExperimentDelay, releaseTime.UnixMilli())
+			}
+		}
+
+		timer := time.NewTimer(experiment.ExperimentDelay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			log.WithError(ctx.Err()).Errorf("[EXPERIMENT] Context canceled before delayed block submit: slot=%d proposer_index=%d", slot, proposerIndex)
+			return
+		}
+		log.Infof("[EXPERIMENT] Byzantine proposer submitting delayed block: slot=%d proposer_index=%d delay=%s", slot, proposerIndex, experiment.ExperimentDelay)
 	}
 
 	blkResp, err := v.validatorClient.ProposeBeaconBlock(ctx, genericSignedBlock)
