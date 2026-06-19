@@ -17,7 +17,7 @@ const (
 	ExperimentAttackStartEpoch = uint64(2)
 
 	// Experiment settings. Change this single value between experiment runs.
-	ExperimentMaliciousFraction = 0.333
+	ExperimentMaliciousFraction = 0.3
 )
 
 // MaliciousValidatorCut returns floor(totalValidators * ExperimentMaliciousFraction).
@@ -25,10 +25,11 @@ func MaliciousValidatorCut(totalValidators uint64) uint64 {
 	return uint64(math.Floor(float64(totalValidators) * ExperimentMaliciousFraction))
 }
 
-func IsMaliciousValidator(validatorIndex, totalValidators uint64) bool {
-	// EXPERIMENT: interleaved Byzantine validator set.
-	// For N=1000, this selects indices 1,4,7,...,997, i.e. 333 validators.
-	return validatorIndex%3 == 1
+func IsMaliciousValidator(validatorIndex uint64, _ uint64) bool {
+	// Delay-4s 300-byzantine setting:
+	// For 1000 validators, validatorIndex % 10 < 3 gives exactly 300 Byzantine validators
+	// and 700 honest validators, while keeping Byzantine validators interleaved.
+	return validatorIndex%10 < 3
 }
 
 func ShouldRunValidatorDuty(validatorIndex uint64) bool {

@@ -85,7 +85,7 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 		if err := w.Write([]string{
 			strconv.FormatUint(uint64(epoch), 10),
 			strconv.FormatUint(uint64(idx), 10),
-			strconv.FormatBool(uint64(idx)%3 == 1),
+			strconv.FormatBool(experiment.IsMaliciousValidator(uint64(idx), 0)),
 			experiment.MaliciousFractionString(),
 			strconv.FormatUint(delta.SourceReward, 10),
 			strconv.FormatUint(delta.TargetReward, 10),
