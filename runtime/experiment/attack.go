@@ -17,19 +17,27 @@ const (
 	ExperimentAttackStartEpoch = uint64(2)
 
 	// Experiment settings. Change this single value between experiment runs.
-	ExperimentMaliciousFraction = 0.3
+	ExperimentMaliciousFraction = 0.333
 )
 
 // MaliciousValidatorCut returns floor(totalValidators * ExperimentMaliciousFraction).
 func MaliciousValidatorCut(totalValidators uint64) uint64 {
+	if count, ok := MaliciousValidatorCountFromFile(); ok {
+		return count
+	}
 	return uint64(math.Floor(float64(totalValidators) * ExperimentMaliciousFraction))
 }
 
-func IsMaliciousValidator(validatorIndex uint64, _ uint64) bool {
-	// Delay-4s 300-byzantine setting:
-	// For 1000 validators, validatorIndex % 10 < 3 gives exactly 300 Byzantine validators
-	// and 700 honest validators, while keeping Byzantine validators interleaved.
-	return validatorIndex%10 < 3
+func IsMaliciousValidator(validatorIndex uint64, totalValidators uint64) bool {
+	if configured, isMalicious := IsMaliciousValidatorFromFile(validatorIndex); configured {
+		return isMalicious
+	}
+
+	if totalValidators == 0 {
+		totalValidators = 1000
+	}
+
+	return validatorIndex < MaliciousValidatorCut(totalValidators)
 }
 
 func ShouldRunValidatorDuty(validatorIndex uint64) bool {
@@ -48,6 +56,9 @@ func ShouldRunValidatorDuty(validatorIndex uint64) bool {
 }
 
 func MaliciousFractionString() string {
+	if fraction, ok := MaliciousFractionStringFromFile(); ok {
+		return fraction
+	}
 	return strconv.FormatFloat(ExperimentMaliciousFraction, 'f', -1, 64)
 }
 
