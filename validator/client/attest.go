@@ -18,6 +18,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
+	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
 	prysmTime "github.com/OffchainLabs/prysm/v7/time"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 	"github.com/OffchainLabs/prysm/v7/validator/client/iface"
@@ -67,6 +68,11 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 	}
 	if duty.CommitteeLength == 0 {
 		log.Debug("Empty committee for validator duty, not attesting")
+		return
+	}
+
+	if experiment.IsReorgMode() && !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
+		log.WithField("validatorIndex", duty.ValidatorIndex).Debug("EXPERIMENT: skipping attestation for validator role")
 		return
 	}
 

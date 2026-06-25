@@ -20,6 +20,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
+	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
 	"github.com/OffchainLabs/prysm/v7/runtime/version"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 	"github.com/OffchainLabs/prysm/v7/validator/client/iface"
@@ -57,6 +58,19 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
 	fmtKey := fmt.Sprintf("%#x", pubKey[:])
 	span.SetAttributes(trace.StringAttribute("validator", fmtKey))
 	log := log.WithField("pubkey", fmt.Sprintf("%#x", bytesutil.Trunc(pubKey[:])))
+
+	duty, err := v.duty(pubKey)
+	if err != nil {
+		log.WithError(err).Error("Could not fetch validator assignment")
+		if v.emitAccountMetrics {
+			ValidatorProposeFailVec.WithLabelValues(fmtKey).Inc()
+		}
+		return
+	}
+	if experiment.IsReorgMode() && !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
+		log.WithField("validatorIndex", duty.ValidatorIndex).Debug("EXPERIMENT: skipping proposal for validator role")
+		return
+	}
 
 	// Sign randao reveal, it's used to request block from beacon node
 	epoch := primitives.Epoch(slot / params.BeaconConfig().SlotsPerEpoch)
