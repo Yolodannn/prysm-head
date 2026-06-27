@@ -15,6 +15,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
+	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	emptypb "github.com/golang/protobuf/ptypes/empty"
@@ -39,6 +40,10 @@ func (v *validator) SubmitSyncCommitteeMessage(ctx context.Context, slot primiti
 	duty, err := v.duty(pubKey)
 	if err != nil {
 		log.WithError(err).Error("Could not fetch validator assignment")
+		return
+	}
+	if experiment.IsReorgMode() && !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
+		log.WithField("validatorIndex", duty.ValidatorIndex).Debug("EXPERIMENT: skipping sync committee message for validator role")
 		return
 	}
 
@@ -103,6 +108,10 @@ func (v *validator) SubmitSignedContributionAndProof(ctx context.Context, slot p
 	duty, err := v.duty(pubKey)
 	if err != nil {
 		log.WithError(err).Error("Could not fetch validator assignment")
+		return
+	}
+	if experiment.IsReorgMode() && !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
+		log.WithField("validatorIndex", duty.ValidatorIndex).Debug("EXPERIMENT: skipping sync committee contribution for validator role")
 		return
 	}
 
