@@ -191,6 +191,19 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
 		return
 	}
 
+	experiment.WriteReorgEvent(
+		"block_proposed",
+		"proposal",
+		uint64(slot),
+		uint64(duty.ValidatorIndex),
+		experiment.IsMaliciousValidator(uint64(duty.ValidatorIndex), 0),
+		fmt.Sprintf("%#x", blkResp.BlockRoot),
+		fmt.Sprintf("%#x", blk.Block().ParentRoot()),
+		"",
+		"",
+		0,
+	)
+
 	if err := v.proposeSelfBuildEnvelope(ctx, slot, pubKey, blk); err != nil {
 		log.WithError(err).Error("Failed to propose self-build envelope")
 		return

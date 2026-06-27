@@ -88,6 +88,19 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 		return
 	}
 
+	experiment.WriteReorgEvent(
+		"attestation_data",
+		"attestation",
+		uint64(slot),
+		uint64(duty.ValidatorIndex),
+		experiment.IsMaliciousValidator(uint64(duty.ValidatorIndex), 0),
+		fmt.Sprintf("%#x", data.BeaconBlockRoot),
+		"",
+		fmt.Sprintf("%#x", data.BeaconBlockRoot),
+		"",
+		0,
+	)
+
 	sig, _, err := v.signAtt(ctx, pubKey, data, slot)
 	if err != nil {
 		log.WithError(err).Error("Could not sign attestation")
