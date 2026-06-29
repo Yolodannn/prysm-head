@@ -179,3 +179,86 @@ func AppendReorgWindow(w ReorgWindow) error {
 	cw.Flush()
 	return cw.Error()
 }
+
+func ReadReorgWindows() ([]ReorgWindow, error) {
+	path := ReorgWindowsFilePath()
+	if path == "" {
+		return nil, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	rows, err := csv.NewReader(f).ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	windows := make([]ReorgWindow, 0, len(rows))
+	for i, row := range rows {
+		if i == 0 {
+			continue
+		}
+		if len(row) < 9 {
+			continue
+		}
+
+		vals := make([]uint64, 9)
+		ok := true
+		for j := range vals {
+			v, err := strconv.ParseUint(strings.TrimSpace(row[j]), 10, 64)
+			if err != nil {
+				ok = false
+				break
+			}
+			vals[j] = v
+		}
+		if !ok {
+			continue
+		}
+
+		windows = append(windows, ReorgWindow{
+			Epoch:                  vals[0],
+			StartSlot:              vals[1],
+			PrivateSlot1:           vals[2],
+			PrivateSlot2:           vals[3],
+			IsolatedHonestSlot:     vals[4],
+			ReleaseSlot:            vals[5],
+			ByzProposer1:           vals[6],
+			ByzProposer2:           vals[7],
+			IsolatedHonestProposer: vals[8],
+		})
+	}
+
+	return windows, nil
+}
+
+func ReorgPhaseForSlot(slot uint64) (string, ReorgWindow, bool, error) {
+	windows, err := ReadReorgWindows()
+	if err != nil {
+		return "", ReorgWindow{}, false, err
+	}
+
+	for _, w := range windows {
+		switch slot {
+		case w.PrivateSlot1:
+			return "private_slot_1", w, true, nil
+		case w.PrivateSlot2:
+			return "private_slot_2", w, true, nil
+		case w.IsolatedHonestSlot:
+			return "isolated_honest_slot", w, true, nil
+		case w.ReleaseSlot:
+			return "release_slot", w, true, nil
+		}
+	}
+
+	return "", ReorgWindow{}, false, nil
+}

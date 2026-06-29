@@ -27,6 +27,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
 	enginev1 "github.com/OffchainLabs/prysm/v7/proto/engine/v1"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
 	"github.com/OffchainLabs/prysm/v7/runtime/version"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 	"github.com/ethereum/go-ethereum/common"
@@ -41,6 +42,21 @@ import (
 
 // eth1DataNotification is a latch to stop flooding logs with the same warning.
 var eth1DataNotification bool
+
+func reorgBeaconLogFields(phase string, w experiment.ReorgWindow) logrus.Fields {
+	return logrus.Fields{
+		"phase":                  phase,
+		"epoch":                  w.Epoch,
+		"startSlot":              w.StartSlot,
+		"privateSlot1":           w.PrivateSlot1,
+		"privateSlot2":           w.PrivateSlot2,
+		"isolatedHonestSlot":     w.IsolatedHonestSlot,
+		"releaseSlot":            w.ReleaseSlot,
+		"byzProposer1":           w.ByzProposer1,
+		"byzProposer2":           w.ByzProposer2,
+		"isolatedHonestProposer": w.IsolatedHonestProposer,
+	}
+}
 
 const (
 	eth1dataTimeout           = 2 * time.Second
@@ -62,6 +78,11 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
 	}
 
 	log := log.WithField("slot", req.Slot)
+	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(req.Slot)); err != nil {
+		log.WithError(err).Warn("[REORG] Beacon failed to read scheduled reorg windows")
+	} else if ok {
+		log.WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Beacon GetBeaconBlock matched scheduled phase")
+	}
 	log.WithField("sinceSlotStartTime", time.Since(t)).Info("Begin building block")
 
 	// A syncing validator should not produce a block.
@@ -339,6 +360,11 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
 	root, err := block.Block().HashTreeRoot()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not hash tree root: %v", err)
+	}
+	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(block.Block().Slot())); err != nil {
+		log.WithError(err).WithField("slot", block.Block().Slot()).Warn("[REORG] Beacon failed to read scheduled reorg windows")
+	} else if ok {
+		log.WithField("slot", block.Block().Slot()).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Beacon ProposeBeaconBlock matched scheduled phase")
 	}
 
 	// For post-Fulu blinded blocks, submit to relay and return early
