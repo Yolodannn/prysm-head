@@ -256,6 +256,13 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
 		log.WithError(err).Warn("[REORG] Beacon failed to read scheduled reorg windows")
 	} else if ok && phase == "private_slot_2" {
 		if privateState, privateRoot, ok := reorgPrivateParent(w.PrivateSlot1); ok {
+			if privateState.Slot() < req.Slot {
+				privateState, err = transition.ProcessSlots(ctx, privateState, req.Slot)
+				if err != nil {
+					log.WithError(err).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Failed to advance private parent state")
+					return nil, status.Errorf(codes.Internal, "could not advance private parent state: %v", err)
+				}
+			}
 			head = privateState
 			parentRoot = privateRoot
 			log.WithFields(reorgBeaconLogFields(phase, w)).WithField("privateParentRoot", fmt.Sprintf("%#x", parentRoot)).Warn("[REORG] Building block on private parent")
