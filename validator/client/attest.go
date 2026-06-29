@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -27,6 +28,21 @@ import (
 )
 
 var failedAttLocalProtectionErr = "attempted to make slashable attestation, rejected by local slashing protection"
+
+func reorgDecodeRoot(root string) ([]byte, error) {
+	b, err := hex.DecodeString(strings.TrimPrefix(root, "0x"))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) != fieldparams.RootLength {
+		return nil, fmt.Errorf("invalid reorg root length %d", len(b))
+	}
+	return b, nil
+}
+
+func reorgIsPrivateVotePhase(phase string) bool {
+	return phase == "private_slot_1" || phase == "private_slot_2" || phase == "isolated_honest_slot"
+}
 
 // SubmitAttestation completes the validator client's attester responsibility at a given slot.
 // It fetches the latest beacon block head along with the latest canonical beacon state
@@ -86,6 +102,56 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 		}
 		tracing.AnnotateError(span, err)
 		return
+	}
+
+	reorgWithholdAttestation := false
+	reorgPrivateVoteRoot := ""
+	reorgPrivateVotePhase := ""
+	var reorgPrivateVoteWindow experiment.ReorgWindow
+
+	if experiment.IsReorgMode() && experiment.IsMaliciousValidator(uint64(duty.ValidatorIndex), 0) {
+		privateRoot, phase, window, ok, err := experiment.ReorgPrivateVoteRootForSlot(uint64(slot))
+		if err != nil {
+			log.WithError(err).WithField("validatorIndex", duty.ValidatorIndex).Warn("[REORG] Failed to read private vote root")
+			return
+		}
+
+		if reorgIsPrivateVotePhase(phase) {
+			if !ok || privateRoot == "" {
+				log.WithFields(logrus.Fields{
+					"validatorIndex": duty.ValidatorIndex,
+					"phase":          phase,
+				}).Warn("[REORG] Missing private vote root, withholding byzantine attestation instead of public vote")
+				return
+			}
+
+			privateRootBytes, err := reorgDecodeRoot(privateRoot)
+			if err != nil {
+				log.WithError(err).WithFields(logrus.Fields{
+					"validatorIndex": duty.ValidatorIndex,
+					"phase":          phase,
+					"privateRoot":    privateRoot,
+				}).Warn("[REORG] Invalid private vote root")
+				return
+			}
+
+			publicRoot := fmt.Sprintf("%#x", data.BeaconBlockRoot)
+			data.BeaconBlockRoot = privateRootBytes
+
+			reorgWithholdAttestation = true
+			reorgPrivateVoteRoot = privateRoot
+			reorgPrivateVotePhase = phase
+			reorgPrivateVoteWindow = window
+
+			log.WithFields(logrus.Fields{
+				"validatorIndex": duty.ValidatorIndex,
+				"phase":          phase,
+				"publicRoot":     publicRoot,
+				"privateRoot":    privateRoot,
+				"startSlot":      window.StartSlot,
+				"releaseSlot":    window.ReleaseSlot,
+			}).Warn("[REORG] Byzantine attester voting for private root and withholding attestation")
+		}
 	}
 
 	experiment.WriteReorgEvent(
@@ -157,7 +223,9 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 			Signature:     sig,
 		}
 		attestation = sa
-		attResp, err = v.validatorClient.ProposeAttestationElectra(ctx, sa)
+		if !reorgWithholdAttestation {
+			attResp, err = v.validatorClient.ProposeAttestationElectra(ctx, sa)
+		}
 	} else {
 		aggregationBitfield = bitfield.NewBitlist(duty.CommitteeLength)
 		aggregationBitfield.SetBitAt(duty.ValidatorCommitteeIndex, true)
@@ -167,8 +235,82 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 			Signature:       sig,
 		}
 		attestation = a
-		attResp, err = v.validatorClient.ProposeAttestation(ctx, a)
+		if !reorgWithholdAttestation {
+			attResp, err = v.validatorClient.ProposeAttestation(ctx, a)
+		}
 	}
+	if reorgWithholdAttestation {
+		slotDelta := uint64(0)
+		if reorgPrivateVoteWindow.IsolatedHonestSlot > uint64(slot) {
+			slotDelta = reorgPrivateVoteWindow.IsolatedHonestSlot - uint64(slot)
+		}
+		slotDuration := time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second
+		delay := time.Duration(slotDelta)*slotDuration + 5*time.Second
+
+		log.WithFields(logrus.Fields{
+			"validatorIndex": duty.ValidatorIndex,
+			"phase":          reorgPrivateVotePhase,
+			"privateRoot":    reorgPrivateVoteRoot,
+			"delay":          delay.String(),
+			"startSlot":      reorgPrivateVoteWindow.StartSlot,
+			"releaseSlot":    reorgPrivateVoteWindow.ReleaseSlot,
+		}).Warn("[REORG] Scheduled withheld Byzantine attestation release")
+
+		go func() {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			<-timer.C
+
+			submitCtx := context.Background()
+			var submitErr error
+
+			if postElectra {
+				sa, ok := attestation.(*ethpb.SingleAttestation)
+				if !ok {
+					log.WithField("validatorIndex", duty.ValidatorIndex).Warn("[REORG] Withheld attestation type mismatch for Electra")
+					return
+				}
+				_, submitErr = v.validatorClient.ProposeAttestationElectra(submitCtx, sa)
+			} else {
+				a, ok := attestation.(*ethpb.Attestation)
+				if !ok {
+					log.WithField("validatorIndex", duty.ValidatorIndex).Warn("[REORG] Withheld attestation type mismatch")
+					return
+				}
+				_, submitErr = v.validatorClient.ProposeAttestation(submitCtx, a)
+			}
+
+			if submitErr != nil {
+				log.WithError(submitErr).WithFields(logrus.Fields{
+					"validatorIndex": duty.ValidatorIndex,
+					"phase":          reorgPrivateVotePhase,
+					"privateRoot":    reorgPrivateVoteRoot,
+				}).Warn("[REORG] Failed to release withheld Byzantine attestation")
+				return
+			}
+
+			if err := v.saveSubmittedAtt(attestation, pubKey[:], false); err != nil {
+				log.WithError(err).WithField("validatorIndex", duty.ValidatorIndex).Warn("[REORG] Could not save released Byzantine attestation")
+				return
+			}
+
+			if v.emitAccountMetrics {
+				ValidatorAttestSuccessVec.WithLabelValues(fmtKey).Inc()
+				ValidatorAttestedSlotsGaugeVec.WithLabelValues(fmtKey).Set(float64(slot))
+			}
+
+			log.WithFields(logrus.Fields{
+				"validatorIndex": duty.ValidatorIndex,
+				"phase":          reorgPrivateVotePhase,
+				"privateRoot":    reorgPrivateVoteRoot,
+				"startSlot":      reorgPrivateVoteWindow.StartSlot,
+				"releaseSlot":    reorgPrivateVoteWindow.ReleaseSlot,
+			}).Warn("[REORG] Released withheld Byzantine attestation")
+		}()
+
+		return
+	}
+
 	if err != nil {
 		log.WithError(err).Error("Could not submit attestation to beacon node")
 		if v.emitAccountMetrics {
