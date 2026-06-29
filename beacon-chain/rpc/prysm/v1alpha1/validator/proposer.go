@@ -66,13 +66,15 @@ type reorgPrivateBlock struct {
 
 var reorgPrivateBlocks = struct {
 	sync.Mutex
-	bySlot        map[uint64]reorgPrivateBlock
-	released      map[uint64]bool
-	isolatedRoots map[uint64]string
+	bySlot           map[uint64]reorgPrivateBlock
+	released         map[uint64]bool
+	releaseScheduled map[uint64]bool
+	isolatedRoots    map[uint64]string
 }{
-	bySlot:        make(map[uint64]reorgPrivateBlock),
-	released:      make(map[uint64]bool),
-	isolatedRoots: make(map[uint64]string),
+	bySlot:           make(map[uint64]reorgPrivateBlock),
+	released:         make(map[uint64]bool),
+	releaseScheduled: make(map[uint64]bool),
+	isolatedRoots:    make(map[uint64]string),
 }
 
 func reorgStorePrivateBlock(slot uint64, block interfaces.SignedBeaconBlock, root [fieldparams.RootLength]byte, postState state.BeaconState) {
@@ -135,6 +137,44 @@ func reorgMarkReleased(startSlot uint64) {
 	defer reorgPrivateBlocks.Unlock()
 
 	reorgPrivateBlocks.released[startSlot] = true
+}
+
+func reorgMarkReleaseScheduled(startSlot uint64) bool {
+	reorgPrivateBlocks.Lock()
+	defer reorgPrivateBlocks.Unlock()
+
+	if reorgPrivateBlocks.released[startSlot] || reorgPrivateBlocks.releaseScheduled[startSlot] {
+		return false
+	}
+	reorgPrivateBlocks.releaseScheduled[startSlot] = true
+	return true
+}
+
+func (vs *Server) reorgScheduleTimedRelease(w experiment.ReorgWindow, releaseAt time.Time) {
+	if !reorgMarkReleaseScheduled(w.StartSlot) {
+		return
+	}
+
+	delay := max(time.Until(releaseAt), 0)
+
+	log.WithFields(reorgBeaconLogFields("isolated_honest_slot", w)).WithFields(logrus.Fields{
+		"releaseAt": releaseAt,
+		"delay":     delay.String(),
+	}).Warn("[REORG] Scheduled timed release at isolated slot +11s")
+
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
+		<-timer.C
+
+		if err := vs.reorgReleasePrivateBlocks(context.Background(), w); err != nil {
+			log.WithError(err).WithFields(reorgBeaconLogFields("timed_release", w)).Warn("[REORG] Timed release failed")
+			return
+		}
+
+		log.WithFields(reorgBeaconLogFields("timed_release", w)).Warn("[REORG] Timed release completed")
+	}()
 }
 
 func (vs *Server) reorgReleasePrivateBlocks(ctx context.Context, w experiment.ReorgWindow) error {
@@ -242,6 +282,9 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
 		log.WithError(err).Warn("[REORG] Beacon failed to read scheduled reorg windows")
 	} else if ok {
 		log.WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Beacon GetBeaconBlock matched scheduled phase")
+		if phase == "isolated_honest_slot" {
+			vs.reorgScheduleTimedRelease(w, t.Add(11*time.Second))
+		}
 	}
 	log.WithField("sinceSlotStartTime", time.Since(t)).Info("Begin building block")
 
