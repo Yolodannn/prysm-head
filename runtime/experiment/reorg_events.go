@@ -262,3 +262,93 @@ func ReorgPhaseForSlot(slot uint64) (string, ReorgWindow, bool, error) {
 
 	return "", ReorgWindow{}, false, nil
 }
+
+type ReorgResult struct {
+	Epoch              uint64
+	StartSlot          uint64
+	PrivateSlot1       uint64
+	PrivateSlot2       uint64
+	IsolatedHonestSlot uint64
+	ReleaseSlot        uint64
+
+	PrivateRoot1       string
+	PrivateRoot2       string
+	IsolatedHonestRoot string
+	ReleaseBlockRoot   string
+	ReleaseParentRoot  string
+	Success            string
+	Reason             string
+}
+
+func ReorgResultsFilePath() string {
+	return os.Getenv("EXPERIMENT_REORG_RESULTS_CSV")
+}
+
+func ShouldWriteReorgResults() bool {
+	return ReorgResultsFilePath() != ""
+}
+
+func AppendReorgResult(r ReorgResult) error {
+	path := ReorgResultsFilePath()
+	if path == "" {
+		return nil
+	}
+
+	needHeader := false
+	if st, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			needHeader = true
+		} else {
+			return err
+		}
+	} else if st.Size() == 0 {
+		needHeader = true
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	if needHeader {
+		if err := w.Write([]string{
+			"epoch",
+			"start_slot",
+			"private_slot_1",
+			"private_slot_2",
+			"isolated_honest_slot",
+			"release_slot",
+			"private_root_1",
+			"private_root_2",
+			"isolated_honest_root",
+			"release_block_root",
+			"release_parent_root",
+			"success",
+			"reason",
+		}); err != nil {
+			return err
+		}
+	}
+
+	return w.Write([]string{
+		strconv.FormatUint(r.Epoch, 10),
+		strconv.FormatUint(r.StartSlot, 10),
+		strconv.FormatUint(r.PrivateSlot1, 10),
+		strconv.FormatUint(r.PrivateSlot2, 10),
+		strconv.FormatUint(r.IsolatedHonestSlot, 10),
+		strconv.FormatUint(r.ReleaseSlot, 10),
+		r.PrivateRoot1,
+		r.PrivateRoot2,
+		r.IsolatedHonestRoot,
+		r.ReleaseBlockRoot,
+		r.ReleaseParentRoot,
+		r.Success,
+		r.Reason,
+	})
+}

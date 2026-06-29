@@ -66,11 +66,13 @@ type reorgPrivateBlock struct {
 
 var reorgPrivateBlocks = struct {
 	sync.Mutex
-	bySlot   map[uint64]reorgPrivateBlock
-	released map[uint64]bool
+	bySlot        map[uint64]reorgPrivateBlock
+	released      map[uint64]bool
+	isolatedRoots map[uint64]string
 }{
-	bySlot:   make(map[uint64]reorgPrivateBlock),
-	released: make(map[uint64]bool),
+	bySlot:        make(map[uint64]reorgPrivateBlock),
+	released:      make(map[uint64]bool),
+	isolatedRoots: make(map[uint64]string),
 }
 
 func reorgStorePrivateBlock(slot uint64, block interfaces.SignedBeaconBlock, root [fieldparams.RootLength]byte, postState state.BeaconState) {
@@ -90,6 +92,24 @@ func reorgLoadPrivateBlock(slot uint64) (reorgPrivateBlock, bool) {
 
 	b, ok := reorgPrivateBlocks.bySlot[slot]
 	return b, ok
+}
+
+func reorgStoreIsolatedRoot(slot uint64, root string) {
+	reorgPrivateBlocks.Lock()
+	defer reorgPrivateBlocks.Unlock()
+
+	reorgPrivateBlocks.isolatedRoots[slot] = root
+}
+
+func reorgLoadIsolatedRoot(slot uint64) string {
+	reorgPrivateBlocks.Lock()
+	defer reorgPrivateBlocks.Unlock()
+
+	return reorgPrivateBlocks.isolatedRoots[slot]
+}
+
+func reorgRootString(root [fieldparams.RootLength]byte) string {
+	return fmt.Sprintf("%#x", root)
 }
 
 func reorgPrivateParent(slot uint64) (state.BeaconState, [fieldparams.RootLength]byte, bool) {
@@ -532,6 +552,9 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
 		log.WithError(err).WithField("slot", block.Block().Slot()).Warn("[REORG] Beacon failed to read scheduled reorg windows")
 	} else if ok {
 		log.WithField("slot", block.Block().Slot()).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Beacon ProposeBeaconBlock matched scheduled phase")
+		if phase == "isolated_honest_slot" {
+			reorgStoreIsolatedRoot(uint64(block.Block().Slot()), reorgRootString(root))
+		}
 	}
 
 	// For post-Fulu blinded blocks, submit to relay and return early
@@ -561,6 +584,63 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
 		log.WithError(err).WithField("slot", block.Block().Slot()).Warn("[REORG] Beacon failed to read scheduled reorg windows")
 	} else if ok && (phase == "private_slot_1" || phase == "private_slot_2") {
 		return vs.reorgWithholdPrivateBlock(ctx, phase, w, block, root)
+	} else if ok && phase == "release_slot" {
+		private1, ok1 := reorgLoadPrivateBlock(w.PrivateSlot1)
+		private2, ok2 := reorgLoadPrivateBlock(w.PrivateSlot2)
+
+		privateRoot1 := ""
+		privateRoot2 := ""
+		if ok1 {
+			privateRoot1 = reorgRootString(private1.root)
+		}
+		if ok2 {
+			privateRoot2 = reorgRootString(private2.root)
+		}
+
+		releaseBlockRoot := reorgRootString(root)
+		releaseParentRoot := fmt.Sprintf("%#x", block.Block().ParentRoot())
+		isolatedRoot := reorgLoadIsolatedRoot(w.IsolatedHonestSlot)
+
+		success := "false"
+		reason := "release_parent_not_private_slot_2"
+		if !ok1 {
+			reason = "missing_private_slot_1"
+		} else if !ok2 {
+			reason = "missing_private_slot_2"
+		} else if releaseParentRoot == privateRoot2 {
+			success = "true"
+			reason = "release_parent_matches_private_slot_2"
+		}
+
+		if experiment.ShouldWriteReorgResults() {
+			if err := experiment.AppendReorgResult(experiment.ReorgResult{
+				Epoch:              w.Epoch,
+				StartSlot:          w.StartSlot,
+				PrivateSlot1:       w.PrivateSlot1,
+				PrivateSlot2:       w.PrivateSlot2,
+				IsolatedHonestSlot: w.IsolatedHonestSlot,
+				ReleaseSlot:        w.ReleaseSlot,
+				PrivateRoot1:       privateRoot1,
+				PrivateRoot2:       privateRoot2,
+				IsolatedHonestRoot: isolatedRoot,
+				ReleaseBlockRoot:   releaseBlockRoot,
+				ReleaseParentRoot:  releaseParentRoot,
+				Success:            success,
+				Reason:             reason,
+			}); err != nil {
+				log.WithError(err).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Failed to write reorg result")
+			}
+		}
+
+		log.WithFields(reorgBeaconLogFields(phase, w)).WithFields(logrus.Fields{
+			"privateRoot1":      privateRoot1,
+			"privateRoot2":      privateRoot2,
+			"isolatedRoot":      isolatedRoot,
+			"releaseBlockRoot":  releaseBlockRoot,
+			"releaseParentRoot": releaseParentRoot,
+			"success":           success,
+			"reason":            reason,
+		}).Warn("[REORG] Recorded reorg result")
 	}
 
 	var wg sync.WaitGroup
