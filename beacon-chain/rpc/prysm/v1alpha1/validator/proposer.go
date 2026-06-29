@@ -58,6 +58,146 @@ func reorgBeaconLogFields(phase string, w experiment.ReorgWindow) logrus.Fields 
 	}
 }
 
+type reorgPrivateBlock struct {
+	block     interfaces.SignedBeaconBlock
+	root      [fieldparams.RootLength]byte
+	postState state.BeaconState
+}
+
+var reorgPrivateBlocks = struct {
+	sync.Mutex
+	bySlot   map[uint64]reorgPrivateBlock
+	released map[uint64]bool
+}{
+	bySlot:   make(map[uint64]reorgPrivateBlock),
+	released: make(map[uint64]bool),
+}
+
+func reorgStorePrivateBlock(slot uint64, block interfaces.SignedBeaconBlock, root [fieldparams.RootLength]byte, postState state.BeaconState) {
+	reorgPrivateBlocks.Lock()
+	defer reorgPrivateBlocks.Unlock()
+
+	reorgPrivateBlocks.bySlot[slot] = reorgPrivateBlock{
+		block:     block,
+		root:      root,
+		postState: postState,
+	}
+}
+
+func reorgLoadPrivateBlock(slot uint64) (reorgPrivateBlock, bool) {
+	reorgPrivateBlocks.Lock()
+	defer reorgPrivateBlocks.Unlock()
+
+	b, ok := reorgPrivateBlocks.bySlot[slot]
+	return b, ok
+}
+
+func reorgPrivateParent(slot uint64) (state.BeaconState, [fieldparams.RootLength]byte, bool) {
+	reorgPrivateBlocks.Lock()
+	defer reorgPrivateBlocks.Unlock()
+
+	b, ok := reorgPrivateBlocks.bySlot[slot]
+	if !ok || b.postState == nil {
+		return nil, [fieldparams.RootLength]byte{}, false
+	}
+	return b.postState.Copy(), b.root, true
+}
+
+func reorgAlreadyReleased(startSlot uint64) bool {
+	reorgPrivateBlocks.Lock()
+	defer reorgPrivateBlocks.Unlock()
+
+	return reorgPrivateBlocks.released[startSlot]
+}
+
+func reorgMarkReleased(startSlot uint64) {
+	reorgPrivateBlocks.Lock()
+	defer reorgPrivateBlocks.Unlock()
+
+	reorgPrivateBlocks.released[startSlot] = true
+}
+
+func (vs *Server) reorgReleasePrivateBlocks(ctx context.Context, w experiment.ReorgWindow) error {
+	if reorgAlreadyReleased(w.StartSlot) {
+		return nil
+	}
+
+	for _, slot := range []uint64{w.PrivateSlot1, w.PrivateSlot2} {
+		privateBlock, ok := reorgLoadPrivateBlock(slot)
+		if !ok {
+			return fmt.Errorf("missing private block for slot %d", slot)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		if err := vs.broadcastReceiveBlock(ctx, &wg, privateBlock.block, privateBlock.root); err != nil {
+			return err
+		}
+
+		log.WithFields(logrus.Fields{
+			"slot":      slot,
+			"root":      fmt.Sprintf("%#x", privateBlock.root),
+			"startSlot": w.StartSlot,
+		}).Warn("[REORG] Released private block")
+	}
+
+	reorgMarkReleased(w.StartSlot)
+	return nil
+}
+
+func (vs *Server) reorgPrivatePreState(
+	ctx context.Context,
+	phase string,
+	w experiment.ReorgWindow,
+	block interfaces.SignedBeaconBlock,
+	root [fieldparams.RootLength]byte,
+) (state.BeaconState, error) {
+	if phase == "private_slot_2" {
+		privateState, _, ok := reorgPrivateParent(w.PrivateSlot1)
+		if !ok {
+			return nil, fmt.Errorf("missing private parent state for slot %d", w.PrivateSlot1)
+		}
+		return privateState, nil
+	}
+
+	roblock, err := blocks.NewROBlockWithRoot(block, root)
+	if err != nil {
+		return nil, err
+	}
+	return vs.BlockReceiver.GetPrestateToPropose(ctx, roblock)
+}
+
+func (vs *Server) reorgWithholdPrivateBlock(
+	ctx context.Context,
+	phase string,
+	w experiment.ReorgWindow,
+	block interfaces.SignedBeaconBlock,
+	root [fieldparams.RootLength]byte,
+) (*ethpb.ProposeResponse, error) {
+	preState, err := vs.reorgPrivatePreState(ctx, phase, w, block, root)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "could not get private pre-state: %v", err)
+	}
+
+	postState, err := transition.ExecuteStateTransition(ctx, preState, block)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "could not execute private state transition: %v", err)
+	}
+
+	slot := uint64(block.Block().Slot())
+	reorgStorePrivateBlock(slot, block, root, postState)
+
+	log.WithFields(logrus.Fields{
+		"slot":       slot,
+		"phase":      phase,
+		"root":       fmt.Sprintf("%#x", root),
+		"parentRoot": fmt.Sprintf("%#x", block.Block().ParentRoot()),
+		"startSlot":  w.StartSlot,
+	}).Warn("[REORG] Withheld private block")
+
+	return &ethpb.ProposeResponse{BlockRoot: root[:]}, nil
+}
+
 const (
 	eth1dataTimeout           = 2 * time.Second
 	defaultBuilderBoostFactor = primitives.Gwei(100)
@@ -98,10 +238,30 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
 		}
 	}
 
+	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(req.Slot)); err != nil {
+		log.WithError(err).Warn("[REORG] Beacon failed to read scheduled reorg windows")
+	} else if ok && phase == "release_slot" {
+		if err := vs.reorgReleasePrivateBlocks(ctx, w); err != nil {
+			log.WithError(err).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Failed to release private blocks")
+		}
+	}
+
 	head, parentRoot, err := vs.getParentState(ctx, req.Slot)
 	if err != nil {
 		log.WithError(err).Error("Fail to build block: could not get parent state")
 		return nil, err
+	}
+
+	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(req.Slot)); err != nil {
+		log.WithError(err).Warn("[REORG] Beacon failed to read scheduled reorg windows")
+	} else if ok && phase == "private_slot_2" {
+		if privateState, privateRoot, ok := reorgPrivateParent(w.PrivateSlot1); ok {
+			head = privateState
+			parentRoot = privateRoot
+			log.WithFields(reorgBeaconLogFields(phase, w)).WithField("privateParentRoot", fmt.Sprintf("%#x", parentRoot)).Warn("[REORG] Building block on private parent")
+		} else {
+			log.WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Missing private parent; falling back to public head")
+		}
 	}
 	sBlk, err := getEmptyBlock(req.Slot)
 	if err != nil {
@@ -388,6 +548,12 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
 	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%s: %v", "handle block failed", err)
+	}
+
+	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(block.Block().Slot())); err != nil {
+		log.WithError(err).WithField("slot", block.Block().Slot()).Warn("[REORG] Beacon failed to read scheduled reorg windows")
+	} else if ok && (phase == "private_slot_1" || phase == "private_slot_2") {
+		return vs.reorgWithholdPrivateBlock(ctx, phase, w, block, root)
 	}
 
 	var wg sync.WaitGroup
@@ -680,7 +846,15 @@ func (vs *Server) computeStateRoot(ctx context.Context, block interfaces.SignedB
 	}
 	beaconState, err := vs.BlockReceiver.GetPrestateToPropose(ctx, roblock)
 	if err != nil {
-		return nil, errors.Wrap(err, "could not retrieve beacon state")
+		if phase, w, ok, phaseErr := experiment.ReorgPhaseForSlot(uint64(block.Block().Slot())); phaseErr == nil && ok && phase == "private_slot_2" {
+			if privateState, _, privateOK := reorgPrivateParent(w.PrivateSlot1); privateOK {
+				beaconState = privateState
+				err = nil
+			}
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "could not retrieve beacon state")
+		}
 	}
 	root, err := transition.CalculateStateRoot(
 		ctx,
