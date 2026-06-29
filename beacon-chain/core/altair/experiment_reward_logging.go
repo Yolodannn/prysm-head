@@ -15,7 +15,14 @@ import (
 	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
 )
 
-const experimentRewardCSVPath = "/home/suliudan2001/workspace/devnet/rewards.csv"
+const defaultExperimentRewardCSVPath = "/home/suliudan2001/workspace/devnet/rewards.csv"
+
+func experimentRewardCSVPath() string {
+	if path := os.Getenv("EXPERIMENT_REWARDS_CSV"); path != "" {
+		return path
+	}
+	return defaultExperimentRewardCSVPath
+}
 
 var experimentRewardStartupLogOnce sync.Once
 
@@ -37,15 +44,15 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 		log.Info(experiment.StartupLog(totalValidators))
 	})
 
-	if err := file.MkdirAll(filepath.Dir(experimentRewardCSVPath)); err != nil {
+	if err := file.MkdirAll(filepath.Dir(experimentRewardCSVPath())); err != nil {
 		log.WithError(err).Error("EXPERIMENT: could not create reward CSV directory")
 		return
 	}
 
-	info, statErr := os.Stat(experimentRewardCSVPath)
+	info, statErr := os.Stat(experimentRewardCSVPath())
 	newFile := os.IsNotExist(statErr) || (statErr == nil && info.Size() == 0)
 
-	f, err := os.OpenFile(experimentRewardCSVPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(experimentRewardCSVPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		log.WithError(err).Error("EXPERIMENT: could not open reward CSV")
 		return
@@ -109,7 +116,7 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 	}
 
 	log.WithFields(map[string]any{
-		"path":  experimentRewardCSVPath,
+		"path":  experimentRewardCSVPath(),
 		"epoch": epoch,
 		"rows":  rows,
 	}).Info("EXPERIMENT: epoch rewards written")
