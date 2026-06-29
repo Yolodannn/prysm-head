@@ -160,7 +160,7 @@ func (vs *Server) reorgScheduleTimedRelease(w experiment.ReorgWindow, releaseAt 
 	log.WithFields(reorgBeaconLogFields("isolated_honest_slot", w)).WithFields(logrus.Fields{
 		"releaseAt": releaseAt,
 		"delay":     delay.String(),
-	}).Warn("[REORG] Scheduled timed release at isolated slot +11s")
+	}).Warn("[REORG] Scheduled timed release at isolated slot +9s")
 
 	go func() {
 		timer := time.NewTimer(delay)
@@ -283,7 +283,7 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
 	} else if ok {
 		log.WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Beacon GetBeaconBlock matched scheduled phase")
 		if phase == "isolated_honest_slot" {
-			vs.reorgScheduleTimedRelease(w, t.Add(11*time.Second))
+			vs.reorgScheduleTimedRelease(w, t.Add(9*time.Second))
 		}
 	}
 	log.WithField("sinceSlotStartTime", time.Since(t)).Info("Begin building block")
