@@ -147,6 +147,21 @@ func (v *validator) detectNaturalReorgWindows(epochStartSlot primitives.Slot) {
 		}
 
 		if recordReorgWindow(w) {
+			if experiment.ShouldWriteReorgWindows() {
+				if err := experiment.AppendReorgWindow(experiment.ReorgWindow{
+					Epoch:                  uint64(w.Epoch),
+					StartSlot:              uint64(w.StartSlot),
+					PrivateSlot1:           uint64(w.PrivateSlot1),
+					PrivateSlot2:           uint64(w.PrivateSlot2),
+					IsolatedHonestSlot:     uint64(w.IsolatedHonestSlot),
+					ReleaseSlot:            uint64(w.ReleaseSlot),
+					ByzProposer1:           uint64(w.ByzProposer1),
+					ByzProposer2:           uint64(w.ByzProposer2),
+					IsolatedHonestProposer: uint64(w.IsolatedHonestProposer),
+				}); err != nil {
+					log.WithError(err).WithFields(reorgWindowLogFields(w)).Warn("[REORG] Failed to write B,B,H attack window")
+				}
+			}
 			log.WithFields(reorgWindowLogFields(w)).Warn("[REORG] Natural B,B,H attack window scheduled")
 		} else {
 			log.WithFields(reorgWindowLogFields(w)).Warn("[REORG] Natural B,B,H attack window skipped due to overlap")
