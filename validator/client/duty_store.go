@@ -81,6 +81,20 @@ func (ds *dutyStore) ProposerSlots(idx primitives.ValidatorIndex) []primitives.S
 	return ds.proposerSlots[idx]
 }
 
+// ProposerSchedule returns a reverse proposer duty map: slot -> proposer validator index.
+func (ds *dutyStore) ProposerSchedule() map[primitives.Slot]primitives.ValidatorIndex {
+	if !ds.IsInitialized() {
+		return nil
+	}
+	schedule := make(map[primitives.Slot]primitives.ValidatorIndex)
+	for idx, proposerSlots := range ds.proposerSlots {
+		for _, slot := range proposerSlots {
+			schedule[slot] = idx
+		}
+	}
+	return schedule
+}
+
 // PtcSlots returns the PTC slots for a given validator index.
 func (ds *dutyStore) PtcSlots(idx primitives.ValidatorIndex) []primitives.Slot {
 	if !ds.IsInitialized() {

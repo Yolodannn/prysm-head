@@ -74,6 +74,7 @@ func (v *validator) UpdateDuties(ctx context.Context) error {
 	}
 	v.dutiesLock.Lock()
 	v.duties.SetFromCombinedDutiesResponse(resp)
+	v.detectNaturalReorgWindows(ss)
 	v.logDuties(ss)
 	v.dutiesLock.Unlock()
 
