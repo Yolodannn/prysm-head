@@ -247,6 +247,17 @@ func (vs *Server) reorgWithholdPrivateBlock(
 	slot := uint64(block.Block().Slot())
 	reorgStorePrivateBlock(slot, block, root, postState)
 
+	if experiment.ShouldWriteReorgPrivateRoots() {
+		if err := experiment.AppendReorgPrivateRoot(experiment.ReorgPrivateRoot{
+			Epoch:     w.Epoch,
+			StartSlot: w.StartSlot,
+			Slot:      uint64(block.Block().Slot()),
+			Phase:     phase,
+			BlockRoot: reorgRootString(root),
+		}); err != nil {
+			log.WithError(err).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Failed to write private root")
+		}
+	}
 	log.WithFields(logrus.Fields{
 		"slot":       slot,
 		"phase":      phase,

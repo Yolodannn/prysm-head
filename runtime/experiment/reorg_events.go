@@ -352,3 +352,157 @@ func AppendReorgResult(r ReorgResult) error {
 		r.Reason,
 	})
 }
+
+type ReorgPrivateRoot struct {
+	Epoch     uint64
+	StartSlot uint64
+	Slot      uint64
+	Phase     string
+	BlockRoot string
+}
+
+func ReorgPrivateRootsFilePath() string {
+	return os.Getenv("EXPERIMENT_REORG_PRIVATE_ROOTS_CSV")
+}
+
+func ShouldWriteReorgPrivateRoots() bool {
+	return ReorgPrivateRootsFilePath() != ""
+}
+
+func AppendReorgPrivateRoot(r ReorgPrivateRoot) error {
+	path := ReorgPrivateRootsFilePath()
+	if path == "" {
+		return nil
+	}
+
+	needHeader := false
+	if st, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			needHeader = true
+		} else {
+			return err
+		}
+	} else if st.Size() == 0 {
+		needHeader = true
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	if needHeader {
+		if err := w.Write([]string{
+			"epoch",
+			"start_slot",
+			"slot",
+			"phase",
+			"block_root",
+		}); err != nil {
+			return err
+		}
+	}
+
+	return w.Write([]string{
+		strconv.FormatUint(r.Epoch, 10),
+		strconv.FormatUint(r.StartSlot, 10),
+		strconv.FormatUint(r.Slot, 10),
+		r.Phase,
+		r.BlockRoot,
+	})
+}
+
+func ReadReorgPrivateRoots() ([]ReorgPrivateRoot, error) {
+	path := ReorgPrivateRootsFilePath()
+	if path == "" {
+		return nil, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	rows, err := csv.NewReader(f).ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]ReorgPrivateRoot, 0, len(rows))
+	for i, row := range rows {
+		if i == 0 {
+			continue
+		}
+		if len(row) < 5 {
+			continue
+		}
+
+		epoch, err := strconv.ParseUint(row[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		startSlot, err := strconv.ParseUint(row[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		slot, err := strconv.ParseUint(row[2], 10, 64)
+		if err != nil {
+			continue
+		}
+
+		out = append(out, ReorgPrivateRoot{
+			Epoch:     epoch,
+			StartSlot: startSlot,
+			Slot:      slot,
+			Phase:     row[3],
+			BlockRoot: row[4],
+		})
+	}
+
+	return out, nil
+}
+
+func ReorgPrivateVoteRootForSlot(slot uint64) (string, string, ReorgWindow, bool, error) {
+	phase, w, ok, err := ReorgPhaseForSlot(slot)
+	if err != nil || !ok {
+		return "", "", ReorgWindow{}, false, err
+	}
+
+	var voteSlot uint64
+	switch phase {
+	case "private_slot_1":
+		voteSlot = w.PrivateSlot1
+	case "private_slot_2":
+		voteSlot = w.PrivateSlot2
+	case "isolated_honest_slot":
+		voteSlot = w.PrivateSlot2
+	default:
+		return "", phase, w, false, nil
+	}
+
+	roots, err := ReadReorgPrivateRoots()
+	if err != nil {
+		return "", phase, w, false, err
+	}
+
+	for i := len(roots) - 1; i >= 0; i-- {
+		r := roots[i]
+		if r.StartSlot == w.StartSlot && r.Slot == voteSlot {
+			return r.BlockRoot, phase, w, true, nil
+		}
+	}
+
+	return "", phase, w, false, nil
+}
