@@ -249,7 +249,7 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 			}).Warn("[REORG] Failed to compute attestation release time")
 			return
 		}
-		releaseAt = releaseAt.Add(9 * time.Second)
+		releaseAt = releaseAt.Add(9*time.Second + 300*time.Millisecond)
 		delay := max(time.Until(releaseAt), 0)
 
 		log.WithFields(logrus.Fields{
