@@ -26,6 +26,13 @@ func experimentRewardCSVPath() string {
 
 var experimentRewardStartupLogOnce sync.Once
 
+var experimentRewardCSVSeen = struct {
+	sync.Mutex
+	seen map[string]struct{}
+}{
+	seen: make(map[string]struct{}),
+}
+
 func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*precompute.Validator, deltas []*AttDelta) {
 	if os.Getenv("EXPERIMENT_WRITE_REWARDS") != "1" {
 		return
@@ -89,6 +96,16 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 		}
 
 		idx := primitives.ValidatorIndex(i)
+
+		rewardCSVKey := strconv.FormatUint(uint64(epoch), 10) + "," + strconv.FormatUint(uint64(idx), 10)
+		experimentRewardCSVSeen.Lock()
+		if _, ok := experimentRewardCSVSeen.seen[rewardCSVKey]; ok {
+			experimentRewardCSVSeen.Unlock()
+			continue
+		}
+		experimentRewardCSVSeen.seen[rewardCSVKey] = struct{}{}
+		experimentRewardCSVSeen.Unlock()
+
 		delta := deltas[i]
 		total := delta.SourceReward + delta.TargetReward + delta.HeadReward
 
