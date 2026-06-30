@@ -240,12 +240,17 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 		}
 	}
 	if reorgWithholdAttestation {
-		slotDelta := uint64(0)
-		if reorgPrivateVoteWindow.IsolatedHonestSlot > uint64(slot) {
-			slotDelta = reorgPrivateVoteWindow.IsolatedHonestSlot - uint64(slot)
+		releaseAt, err := slots.StartTime(v.genesisTime, primitives.Slot(reorgPrivateVoteWindow.IsolatedHonestSlot))
+		if err != nil {
+			log.WithError(err).WithFields(logrus.Fields{
+				"validatorIndex": duty.ValidatorIndex,
+				"phase":          reorgPrivateVotePhase,
+				"startSlot":      reorgPrivateVoteWindow.StartSlot,
+			}).Warn("[REORG] Failed to compute attestation release time")
+			return
 		}
-		slotDuration := time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second
-		delay := time.Duration(slotDelta)*slotDuration + 5*time.Second
+		releaseAt = releaseAt.Add(9 * time.Second)
+		delay := max(time.Until(releaseAt), 0)
 
 		log.WithFields(logrus.Fields{
 			"validatorIndex": duty.ValidatorIndex,
@@ -254,7 +259,7 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 			"delay":          delay.String(),
 			"startSlot":      reorgPrivateVoteWindow.StartSlot,
 			"releaseSlot":    reorgPrivateVoteWindow.ReleaseSlot,
-		}).Warn("[REORG] Scheduled withheld Byzantine attestation release")
+		}).Warn("[REORG] Scheduled withheld Byzantine attestation release at chain release time")
 
 		go func() {
 			timer := time.NewTimer(delay)
