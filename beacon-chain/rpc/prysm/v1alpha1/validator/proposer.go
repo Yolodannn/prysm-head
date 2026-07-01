@@ -192,19 +192,19 @@ func (vs *Server) reorgReleasePrivateBlocks(ctx context.Context, w experiment.Re
 			return fmt.Errorf("missing private block for slot %d", slot)
 		}
 
-		pb, err := privateBlock.block.Proto()
-		if err != nil {
-			return err
+		var wg sync.WaitGroup
+		wg.Add(1)
+		if err := vs.broadcastReceiveBlock(ctx, &wg, privateBlock.block, privateBlock.root); err != nil {
+			wg.Wait()
+			return fmt.Errorf("release private block slot %d failed: %w", slot, err)
 		}
-		if err := vs.P2P.Broadcast(ctx, pb); err != nil {
-			return err
-		}
+		wg.Wait()
 
 		log.WithFields(logrus.Fields{
 			"slot":      slot,
 			"root":      fmt.Sprintf("%#x", privateBlock.root),
 			"startSlot": w.StartSlot,
-		}).Warn("[REORG] Released private block")
+		}).Warn("[REORG] Released and locally imported private block")
 	}
 
 	reorgMarkReleased(w.StartSlot)
