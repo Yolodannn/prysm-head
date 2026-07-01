@@ -300,6 +300,19 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
 	}
 
 	log := log.WithField("slot", req.Slot)
+	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(req.Slot)); err != nil {
+		log.WithError(err).Warn("[REORG] Beacon failed to read scheduled reorg windows")
+	} else if ok {
+		log.WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Beacon GetBeaconBlock matched scheduled phase")
+		if phase == "isolated_honest_slot_2" {
+			vs.reorgScheduleTimedRelease(w, t.Add(9*time.Second))
+		} else if phase == "release_slot" {
+			if err := vs.reorgReleasePrivateBlocks(ctx, w); err != nil {
+				log.WithError(err).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Failed to release private blocks")
+			}
+		}
+	}
+
 	head, parentRoot, err := vs.getParentState(ctx, req.Slot)
 	if err != nil {
 		log.WithError(err).Error("Fail to build block: could not get parent state")
