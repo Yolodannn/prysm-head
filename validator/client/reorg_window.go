@@ -17,15 +17,19 @@ type reorgWindow struct {
 	PrivateSlot1        primitives.Slot
 	PrivateSlot2        primitives.Slot
 	PrivateSlot3        primitives.Slot
+	PrivateSlot4        primitives.Slot
 	IsolatedHonestSlot1 primitives.Slot
 	IsolatedHonestSlot2 primitives.Slot
+	IsolatedHonestSlot3 primitives.Slot
 	ReleaseSlot         primitives.Slot
 
 	ByzProposer1            primitives.ValidatorIndex
 	ByzProposer2            primitives.ValidatorIndex
 	ByzProposer3            primitives.ValidatorIndex
+	ByzProposer4            primitives.ValidatorIndex
 	IsolatedHonestProposer1 primitives.ValidatorIndex
 	IsolatedHonestProposer2 primitives.ValidatorIndex
+	IsolatedHonestProposer3 primitives.ValidatorIndex
 }
 
 var reorgWindows = struct {
@@ -58,10 +62,14 @@ func reorgPhaseForSlot(slot primitives.Slot) string {
 		return "private_slot_2"
 	case w.PrivateSlot3:
 		return "private_slot_3"
+	case w.PrivateSlot4:
+		return "private_slot_4"
 	case w.IsolatedHonestSlot1:
 		return "isolated_honest_slot_1"
 	case w.IsolatedHonestSlot2:
 		return "isolated_honest_slot_2"
+	case w.IsolatedHonestSlot3:
+		return "isolated_honest_slot_3"
 	case w.ReleaseSlot:
 		return "release_slot"
 	default:
@@ -98,26 +106,23 @@ func reorgWindowLogFields(w reorgWindow) logrus.Fields {
 		"privateSlot1":            w.PrivateSlot1,
 		"privateSlot2":            w.PrivateSlot2,
 		"privateSlot3":            w.PrivateSlot3,
+		"privateSlot4":            w.PrivateSlot4,
 		"isolatedHonestSlot1":     w.IsolatedHonestSlot1,
 		"isolatedHonestSlot2":     w.IsolatedHonestSlot2,
+		"isolatedHonestSlot3":     w.IsolatedHonestSlot3,
 		"releaseSlot":             w.ReleaseSlot,
 		"byzProposer1":            w.ByzProposer1,
 		"byzProposer2":            w.ByzProposer2,
 		"byzProposer3":            w.ByzProposer3,
+		"byzProposer4":            w.ByzProposer4,
 		"isolatedHonestProposer1": w.IsolatedHonestProposer1,
 		"isolatedHonestProposer2": w.IsolatedHonestProposer2,
+		"isolatedHonestProposer3": w.IsolatedHonestProposer3,
 	}
 }
 
 // detectNaturalReorgWindows scans the cached proposer duty schedule and records
-// every non-overlapping natural B,B,B,H,H pattern:
-//
-//	slot s     : Byzantine proposer
-//	slot s+1   : Byzantine proposer
-//	slot s+2   : Byzantine proposer
-//	slot s+3   : Honest proposer to be isolated
-//	slot s+4   : Honest proposer to be isolated
-//	slot s+5   : release slot
+// every non-overlapping natural B,B,B,B,H,H,H pattern.
 func (v *validator) detectNaturalReorgWindows(epochStartSlot primitives.Slot) {
 	schedule := v.duties.ProposerSchedule()
 	if len(schedule) == 0 {
@@ -127,7 +132,7 @@ func (v *validator) detectNaturalReorgWindows(epochStartSlot primitives.Slot) {
 	slotsPerEpoch := params.BeaconConfig().SlotsPerEpoch
 	epoch := slots.ToEpoch(epochStartSlot)
 
-	for offset := primitives.Slot(0); offset+5 < slotsPerEpoch; offset++ {
+	for offset := primitives.Slot(0); offset+7 < slotsPerEpoch; offset++ {
 		s := epochStartSlot + offset
 
 		p0, ok0 := schedule[s]
@@ -135,7 +140,9 @@ func (v *validator) detectNaturalReorgWindows(epochStartSlot primitives.Slot) {
 		p2, ok2 := schedule[s+2]
 		p3, ok3 := schedule[s+3]
 		p4, ok4 := schedule[s+4]
-		if !ok0 || !ok1 || !ok2 || !ok3 || !ok4 {
+		p5, ok5 := schedule[s+5]
+		p6, ok6 := schedule[s+6]
+		if !ok0 || !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 {
 			continue
 		}
 
@@ -144,8 +151,10 @@ func (v *validator) detectNaturalReorgWindows(epochStartSlot primitives.Slot) {
 		b2 := experiment.IsMaliciousValidator(uint64(p2), 0)
 		b3 := experiment.IsMaliciousValidator(uint64(p3), 0)
 		b4 := experiment.IsMaliciousValidator(uint64(p4), 0)
+		b5 := experiment.IsMaliciousValidator(uint64(p5), 0)
+		b6 := experiment.IsMaliciousValidator(uint64(p6), 0)
 
-		if !b0 || !b1 || !b2 || b3 || b4 {
+		if !b0 || !b1 || !b2 || !b3 || b4 || b5 || b6 {
 			continue
 		}
 
@@ -155,14 +164,18 @@ func (v *validator) detectNaturalReorgWindows(epochStartSlot primitives.Slot) {
 			PrivateSlot1:            s,
 			PrivateSlot2:            s + 1,
 			PrivateSlot3:            s + 2,
-			IsolatedHonestSlot1:     s + 3,
-			IsolatedHonestSlot2:     s + 4,
-			ReleaseSlot:             s + 5,
+			PrivateSlot4:            s + 3,
+			IsolatedHonestSlot1:     s + 4,
+			IsolatedHonestSlot2:     s + 5,
+			IsolatedHonestSlot3:     s + 6,
+			ReleaseSlot:             s + 7,
 			ByzProposer1:            p0,
 			ByzProposer2:            p1,
 			ByzProposer3:            p2,
-			IsolatedHonestProposer1: p3,
-			IsolatedHonestProposer2: p4,
+			ByzProposer4:            p3,
+			IsolatedHonestProposer1: p4,
+			IsolatedHonestProposer2: p5,
+			IsolatedHonestProposer3: p6,
 		}
 
 		if recordReorgWindow(w) {
@@ -173,21 +186,25 @@ func (v *validator) detectNaturalReorgWindows(epochStartSlot primitives.Slot) {
 					PrivateSlot1:            uint64(w.PrivateSlot1),
 					PrivateSlot2:            uint64(w.PrivateSlot2),
 					PrivateSlot3:            uint64(w.PrivateSlot3),
+					PrivateSlot4:            uint64(w.PrivateSlot4),
 					IsolatedHonestSlot1:     uint64(w.IsolatedHonestSlot1),
 					IsolatedHonestSlot2:     uint64(w.IsolatedHonestSlot2),
+					IsolatedHonestSlot3:     uint64(w.IsolatedHonestSlot3),
 					ReleaseSlot:             uint64(w.ReleaseSlot),
 					ByzProposer1:            uint64(w.ByzProposer1),
 					ByzProposer2:            uint64(w.ByzProposer2),
 					ByzProposer3:            uint64(w.ByzProposer3),
+					ByzProposer4:            uint64(w.ByzProposer4),
 					IsolatedHonestProposer1: uint64(w.IsolatedHonestProposer1),
 					IsolatedHonestProposer2: uint64(w.IsolatedHonestProposer2),
+					IsolatedHonestProposer3: uint64(w.IsolatedHonestProposer3),
 				}); err != nil {
-					log.WithError(err).WithFields(reorgWindowLogFields(w)).Warn("[REORG] Failed to write B,B,B,H,H attack window")
+					log.WithError(err).WithFields(reorgWindowLogFields(w)).Warn("[REORG] Failed to write B,B,B,B,H,H,H attack window")
 				}
 			}
-			log.WithFields(reorgWindowLogFields(w)).Warn("[REORG] Natural B,B,B,H,H attack window scheduled")
+			log.WithFields(reorgWindowLogFields(w)).Warn("[REORG] Natural B,B,B,B,H,H,H attack window scheduled")
 		} else {
-			log.WithFields(reorgWindowLogFields(w)).Warn("[REORG] Natural B,B,B,H,H attack window skipped due to overlap")
+			log.WithFields(reorgWindowLogFields(w)).Warn("[REORG] Natural B,B,B,B,H,H,H attack window skipped due to overlap")
 		}
 	}
 }

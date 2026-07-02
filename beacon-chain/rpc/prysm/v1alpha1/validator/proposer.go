@@ -51,14 +51,18 @@ func reorgBeaconLogFields(phase string, w experiment.ReorgWindow) logrus.Fields 
 		"privateSlot1":            w.PrivateSlot1,
 		"privateSlot2":            w.PrivateSlot2,
 		"privateSlot3":            w.PrivateSlot3,
+		"privateSlot4":            w.PrivateSlot4,
 		"isolatedHonestSlot1":     w.IsolatedHonestSlot1,
 		"isolatedHonestSlot2":     w.IsolatedHonestSlot2,
+		"isolatedHonestSlot3":     w.IsolatedHonestSlot3,
 		"releaseSlot":             w.ReleaseSlot,
 		"byzProposer1":            w.ByzProposer1,
 		"byzProposer2":            w.ByzProposer2,
 		"byzProposer3":            w.ByzProposer3,
+		"byzProposer4":            w.ByzProposer4,
 		"isolatedHonestProposer1": w.IsolatedHonestProposer1,
 		"isolatedHonestProposer2": w.IsolatedHonestProposer2,
+		"isolatedHonestProposer3": w.IsolatedHonestProposer3,
 	}
 }
 
@@ -161,10 +165,10 @@ func (vs *Server) reorgScheduleTimedRelease(w experiment.ReorgWindow, releaseAt 
 
 	delay := max(time.Until(releaseAt), 0)
 
-	log.WithFields(reorgBeaconLogFields("isolated_honest_slot_2", w)).WithFields(logrus.Fields{
+	log.WithFields(reorgBeaconLogFields("isolated_honest_slot_3", w)).WithFields(logrus.Fields{
 		"releaseAt": releaseAt,
 		"delay":     delay.String(),
-	}).Warn("[REORG] Scheduled timed release at second isolated slot +9s")
+	}).Warn("[REORG] Scheduled timed release at third isolated slot +9s")
 
 	go func() {
 		timer := time.NewTimer(delay)
@@ -186,7 +190,7 @@ func (vs *Server) reorgReleasePrivateBlocks(ctx context.Context, w experiment.Re
 		return nil
 	}
 
-	for _, slot := range []uint64{w.PrivateSlot1, w.PrivateSlot2, w.PrivateSlot3} {
+	for _, slot := range []uint64{w.PrivateSlot1, w.PrivateSlot2, w.PrivateSlot3, w.PrivateSlot4} {
 		privateBlock, ok := reorgLoadPrivateBlock(slot)
 		if !ok {
 			return fmt.Errorf("missing private block for slot %d", slot)
@@ -218,10 +222,12 @@ func (vs *Server) reorgPrivatePreState(
 	block interfaces.SignedBeaconBlock,
 	root [fieldparams.RootLength]byte,
 ) (state.BeaconState, error) {
-	if phase == "private_slot_2" || phase == "private_slot_3" {
+	if phase == "private_slot_2" || phase == "private_slot_3" || phase == "private_slot_4" {
 		parentSlot := w.PrivateSlot1
 		if phase == "private_slot_3" {
 			parentSlot = w.PrivateSlot2
+		} else if phase == "private_slot_4" {
+			parentSlot = w.PrivateSlot3
 		}
 
 		privateState, _, ok := reorgPrivateParent(parentSlot)
@@ -304,7 +310,7 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
 		log.WithError(err).Warn("[REORG] Beacon failed to read scheduled reorg windows")
 	} else if ok {
 		log.WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Beacon GetBeaconBlock matched scheduled phase")
-		if phase == "isolated_honest_slot_2" {
+		if phase == "isolated_honest_slot_3" {
 			vs.reorgScheduleTimedRelease(w, t.Add(9*time.Second))
 		} else if phase == "release_slot" {
 			if err := vs.reorgReleasePrivateBlocks(ctx, w); err != nil {
@@ -321,10 +327,12 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
 
 	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(req.Slot)); err != nil {
 		log.WithError(err).Warn("[REORG] Beacon failed to read scheduled reorg windows")
-	} else if ok && (phase == "private_slot_2" || phase == "private_slot_3") {
+	} else if ok && (phase == "private_slot_2" || phase == "private_slot_3" || phase == "private_slot_4") {
 		parentSlot := w.PrivateSlot1
 		if phase == "private_slot_3" {
 			parentSlot = w.PrivateSlot2
+		} else if phase == "private_slot_4" {
+			parentSlot = w.PrivateSlot3
 		}
 
 		if privateState, privateRoot, ok := reorgPrivateParent(parentSlot); ok {
@@ -604,7 +612,7 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
 		log.WithError(err).WithField("slot", block.Block().Slot()).Warn("[REORG] Beacon failed to read scheduled reorg windows")
 	} else if ok {
 		log.WithField("slot", block.Block().Slot()).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Beacon ProposeBeaconBlock matched scheduled phase")
-		if phase == "isolated_honest_slot_1" || phase == "isolated_honest_slot_2" {
+		if phase == "isolated_honest_slot_1" || phase == "isolated_honest_slot_2" || phase == "isolated_honest_slot_3" {
 			reorgStoreIsolatedRoot(uint64(block.Block().Slot()), reorgRootString(root))
 		}
 	}
@@ -634,16 +642,18 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
 
 	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(block.Block().Slot())); err != nil {
 		log.WithError(err).WithField("slot", block.Block().Slot()).Warn("[REORG] Beacon failed to read scheduled reorg windows")
-	} else if ok && (phase == "private_slot_1" || phase == "private_slot_2" || phase == "private_slot_3") {
+	} else if ok && (phase == "private_slot_1" || phase == "private_slot_2" || phase == "private_slot_3" || phase == "private_slot_4") {
 		return vs.reorgWithholdPrivateBlock(ctx, phase, w, block, root)
 	} else if ok && phase == "release_slot" {
 		private1, ok1 := reorgLoadPrivateBlock(w.PrivateSlot1)
 		private2, ok2 := reorgLoadPrivateBlock(w.PrivateSlot2)
 		private3, ok3 := reorgLoadPrivateBlock(w.PrivateSlot3)
+		private4, ok4 := reorgLoadPrivateBlock(w.PrivateSlot4)
 
 		privateRoot1 := ""
 		privateRoot2 := ""
 		privateRoot3 := ""
+		privateRoot4 := ""
 		if ok1 {
 			privateRoot1 = reorgRootString(private1.root)
 		}
@@ -653,23 +663,29 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
 		if ok3 {
 			privateRoot3 = reorgRootString(private3.root)
 		}
+		if ok4 {
+			privateRoot4 = reorgRootString(private4.root)
+		}
 
 		releaseBlockRoot := reorgRootString(root)
 		releaseParentRoot := fmt.Sprintf("%#x", block.Block().ParentRoot())
 		isolatedRoot1 := reorgLoadIsolatedRoot(w.IsolatedHonestSlot1)
 		isolatedRoot2 := reorgLoadIsolatedRoot(w.IsolatedHonestSlot2)
+		isolatedRoot3 := reorgLoadIsolatedRoot(w.IsolatedHonestSlot3)
 
 		success := "false"
-		reason := "release_parent_not_private_slot_3"
+		reason := "release_parent_not_private_slot_4"
 		if !ok1 {
 			reason = "missing_private_slot_1"
 		} else if !ok2 {
 			reason = "missing_private_slot_2"
 		} else if !ok3 {
 			reason = "missing_private_slot_3"
-		} else if releaseParentRoot == privateRoot3 {
+		} else if !ok4 {
+			reason = "missing_private_slot_4"
+		} else if releaseParentRoot == privateRoot4 {
 			success = "true"
-			reason = "release_parent_matches_private_slot_3"
+			reason = "release_parent_matches_private_slot_4"
 		}
 
 		if experiment.ShouldWriteReorgResults() {
@@ -679,14 +695,18 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
 				PrivateSlot1:        w.PrivateSlot1,
 				PrivateSlot2:        w.PrivateSlot2,
 				PrivateSlot3:        w.PrivateSlot3,
+				PrivateSlot4:        w.PrivateSlot4,
 				IsolatedHonestSlot1: w.IsolatedHonestSlot1,
 				IsolatedHonestSlot2: w.IsolatedHonestSlot2,
+				IsolatedHonestSlot3: w.IsolatedHonestSlot3,
 				ReleaseSlot:         w.ReleaseSlot,
 				PrivateRoot1:        privateRoot1,
 				PrivateRoot2:        privateRoot2,
 				PrivateRoot3:        privateRoot3,
+				PrivateRoot4:        privateRoot4,
 				IsolatedHonestRoot1: isolatedRoot1,
 				IsolatedHonestRoot2: isolatedRoot2,
+				IsolatedHonestRoot3: isolatedRoot3,
 				ReleaseBlockRoot:    releaseBlockRoot,
 				ReleaseParentRoot:   releaseParentRoot,
 				Success:             success,
@@ -700,8 +720,10 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
 			"privateRoot1":      privateRoot1,
 			"privateRoot2":      privateRoot2,
 			"privateRoot3":      privateRoot3,
+			"privateRoot4":      privateRoot4,
 			"isolatedRoot1":     isolatedRoot1,
 			"isolatedRoot2":     isolatedRoot2,
+			"isolatedRoot3":     isolatedRoot3,
 			"releaseBlockRoot":  releaseBlockRoot,
 			"releaseParentRoot": releaseParentRoot,
 			"success":           success,
@@ -999,7 +1021,7 @@ func (vs *Server) computeStateRoot(ctx context.Context, block interfaces.SignedB
 	}
 	beaconState, err := vs.BlockReceiver.GetPrestateToPropose(ctx, roblock)
 	if err != nil {
-		if phase, w, ok, phaseErr := experiment.ReorgPhaseForSlot(uint64(block.Block().Slot())); phaseErr == nil && ok && (phase == "private_slot_2" || phase == "private_slot_3") {
+		if phase, w, ok, phaseErr := experiment.ReorgPhaseForSlot(uint64(block.Block().Slot())); phaseErr == nil && ok && (phase == "private_slot_2" || phase == "private_slot_3" || phase == "private_slot_4") {
 			parentSlot := w.PrivateSlot1
 			if phase == "private_slot_3" {
 				parentSlot = w.PrivateSlot2

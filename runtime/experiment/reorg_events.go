@@ -101,15 +101,19 @@ type ReorgWindow struct {
 	PrivateSlot1        uint64
 	PrivateSlot2        uint64
 	PrivateSlot3        uint64
+	PrivateSlot4        uint64
 	IsolatedHonestSlot1 uint64
 	IsolatedHonestSlot2 uint64
+	IsolatedHonestSlot3 uint64
 	ReleaseSlot         uint64
 
 	ByzProposer1            uint64
 	ByzProposer2            uint64
 	ByzProposer3            uint64
+	ByzProposer4            uint64
 	IsolatedHonestProposer1 uint64
 	IsolatedHonestProposer2 uint64
+	IsolatedHonestProposer3 uint64
 }
 
 func ReorgWindowsFilePath() string {
@@ -157,14 +161,18 @@ func AppendReorgWindow(w ReorgWindow) error {
 			"private_slot_1",
 			"private_slot_2",
 			"private_slot_3",
+			"private_slot_4",
 			"isolated_honest_slot_1",
 			"isolated_honest_slot_2",
+			"isolated_honest_slot_3",
 			"release_slot",
 			"byz_proposer_1",
 			"byz_proposer_2",
 			"byz_proposer_3",
+			"byz_proposer_4",
 			"isolated_honest_proposer_1",
 			"isolated_honest_proposer_2",
+			"isolated_honest_proposer_3",
 		}); err != nil {
 			return err
 		}
@@ -176,14 +184,18 @@ func AppendReorgWindow(w ReorgWindow) error {
 		strconv.FormatUint(w.PrivateSlot1, 10),
 		strconv.FormatUint(w.PrivateSlot2, 10),
 		strconv.FormatUint(w.PrivateSlot3, 10),
+		strconv.FormatUint(w.PrivateSlot4, 10),
 		strconv.FormatUint(w.IsolatedHonestSlot1, 10),
 		strconv.FormatUint(w.IsolatedHonestSlot2, 10),
+		strconv.FormatUint(w.IsolatedHonestSlot3, 10),
 		strconv.FormatUint(w.ReleaseSlot, 10),
 		strconv.FormatUint(w.ByzProposer1, 10),
 		strconv.FormatUint(w.ByzProposer2, 10),
 		strconv.FormatUint(w.ByzProposer3, 10),
+		strconv.FormatUint(w.ByzProposer4, 10),
 		strconv.FormatUint(w.IsolatedHonestProposer1, 10),
 		strconv.FormatUint(w.IsolatedHonestProposer2, 10),
+		strconv.FormatUint(w.IsolatedHonestProposer3, 10),
 	}); err != nil {
 		return err
 	}
@@ -219,11 +231,11 @@ func ReadReorgWindows() ([]ReorgWindow, error) {
 		if i == 0 {
 			continue
 		}
-		if len(row) < 13 {
+		if len(row) < 17 {
 			continue
 		}
 
-		vals := make([]uint64, 13)
+		vals := make([]uint64, 17)
 		ok := true
 		for j := range vals {
 			v, err := strconv.ParseUint(strings.TrimSpace(row[j]), 10, 64)
@@ -243,14 +255,18 @@ func ReadReorgWindows() ([]ReorgWindow, error) {
 			PrivateSlot1:            vals[2],
 			PrivateSlot2:            vals[3],
 			PrivateSlot3:            vals[4],
-			IsolatedHonestSlot1:     vals[5],
-			IsolatedHonestSlot2:     vals[6],
-			ReleaseSlot:             vals[7],
-			ByzProposer1:            vals[8],
-			ByzProposer2:            vals[9],
-			ByzProposer3:            vals[10],
-			IsolatedHonestProposer1: vals[11],
-			IsolatedHonestProposer2: vals[12],
+			PrivateSlot4:            vals[5],
+			IsolatedHonestSlot1:     vals[6],
+			IsolatedHonestSlot2:     vals[7],
+			IsolatedHonestSlot3:     vals[8],
+			ReleaseSlot:             vals[9],
+			ByzProposer1:            vals[10],
+			ByzProposer2:            vals[11],
+			ByzProposer3:            vals[12],
+			ByzProposer4:            vals[13],
+			IsolatedHonestProposer1: vals[14],
+			IsolatedHonestProposer2: vals[15],
+			IsolatedHonestProposer3: vals[16],
 		})
 	}
 
@@ -271,10 +287,14 @@ func ReorgPhaseForSlot(slot uint64) (string, ReorgWindow, bool, error) {
 			return "private_slot_2", w, true, nil
 		case w.PrivateSlot3:
 			return "private_slot_3", w, true, nil
+		case w.PrivateSlot4:
+			return "private_slot_4", w, true, nil
 		case w.IsolatedHonestSlot1:
 			return "isolated_honest_slot_1", w, true, nil
 		case w.IsolatedHonestSlot2:
 			return "isolated_honest_slot_2", w, true, nil
+		case w.IsolatedHonestSlot3:
+			return "isolated_honest_slot_3", w, true, nil
 		case w.ReleaseSlot:
 			return "release_slot", w, true, nil
 		}
@@ -289,15 +309,19 @@ type ReorgResult struct {
 	PrivateSlot1        uint64
 	PrivateSlot2        uint64
 	PrivateSlot3        uint64
+	PrivateSlot4        uint64
 	IsolatedHonestSlot1 uint64
 	IsolatedHonestSlot2 uint64
+	IsolatedHonestSlot3 uint64
 	ReleaseSlot         uint64
 
 	PrivateRoot1        string
 	PrivateRoot2        string
 	PrivateRoot3        string
+	PrivateRoot4        string
 	IsolatedHonestRoot1 string
 	IsolatedHonestRoot2 string
+	IsolatedHonestRoot3 string
 	ReleaseBlockRoot    string
 	ReleaseParentRoot   string
 	Success             string
@@ -347,14 +371,18 @@ func AppendReorgResult(r ReorgResult) error {
 			"private_slot_1",
 			"private_slot_2",
 			"private_slot_3",
+			"private_slot_4",
 			"isolated_honest_slot_1",
 			"isolated_honest_slot_2",
+			"isolated_honest_slot_3",
 			"release_slot",
 			"private_root_1",
 			"private_root_2",
 			"private_root_3",
+			"private_root_4",
 			"isolated_honest_root_1",
 			"isolated_honest_root_2",
+			"isolated_honest_root_3",
 			"release_block_root",
 			"release_parent_root",
 			"success",
@@ -370,14 +398,18 @@ func AppendReorgResult(r ReorgResult) error {
 		strconv.FormatUint(r.PrivateSlot1, 10),
 		strconv.FormatUint(r.PrivateSlot2, 10),
 		strconv.FormatUint(r.PrivateSlot3, 10),
+		strconv.FormatUint(r.PrivateSlot4, 10),
 		strconv.FormatUint(r.IsolatedHonestSlot1, 10),
 		strconv.FormatUint(r.IsolatedHonestSlot2, 10),
+		strconv.FormatUint(r.IsolatedHonestSlot3, 10),
 		strconv.FormatUint(r.ReleaseSlot, 10),
 		r.PrivateRoot1,
 		r.PrivateRoot2,
 		r.PrivateRoot3,
+		r.PrivateRoot4,
 		r.IsolatedHonestRoot1,
 		r.IsolatedHonestRoot2,
+		r.IsolatedHonestRoot3,
 		r.ReleaseBlockRoot,
 		r.ReleaseParentRoot,
 		r.Success,
@@ -520,8 +552,10 @@ func ReorgPrivateVoteRootForSlot(slot uint64) (string, string, ReorgWindow, bool
 		voteSlot = w.PrivateSlot2
 	case "private_slot_3":
 		voteSlot = w.PrivateSlot3
-	case "isolated_honest_slot_1", "isolated_honest_slot_2":
-		voteSlot = w.PrivateSlot3
+	case "private_slot_4":
+		voteSlot = w.PrivateSlot4
+	case "isolated_honest_slot_1", "isolated_honest_slot_2", "isolated_honest_slot_3":
+		voteSlot = w.PrivateSlot4
 	default:
 		return "", phase, w, false, nil
 	}

@@ -44,8 +44,10 @@ func reorgIsPrivateVotePhase(phase string) bool {
 	return phase == "private_slot_1" ||
 		phase == "private_slot_2" ||
 		phase == "private_slot_3" ||
+		phase == "private_slot_4" ||
 		phase == "isolated_honest_slot_1" ||
-		phase == "isolated_honest_slot_2"
+		phase == "isolated_honest_slot_2" ||
+		phase == "isolated_honest_slot_3"
 }
 
 // SubmitAttestation completes the validator client's attester responsibility at a given slot.
@@ -244,7 +246,7 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 		}
 	}
 	if reorgWithholdAttestation {
-		releaseAt, err := slots.StartTime(v.genesisTime, primitives.Slot(reorgPrivateVoteWindow.IsolatedHonestSlot2))
+		releaseAt, err := slots.StartTime(v.genesisTime, primitives.Slot(reorgPrivateVoteWindow.IsolatedHonestSlot3))
 		if err != nil {
 			log.WithError(err).WithFields(logrus.Fields{
 				"validatorIndex": duty.ValidatorIndex,
