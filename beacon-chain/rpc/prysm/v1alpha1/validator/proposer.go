@@ -1025,6 +1025,8 @@ func (vs *Server) computeStateRoot(ctx context.Context, block interfaces.SignedB
 			parentSlot := w.PrivateSlot1
 			if phase == "private_slot_3" {
 				parentSlot = w.PrivateSlot2
+			} else if phase == "private_slot_4" {
+				parentSlot = w.PrivateSlot3
 			}
 			if privateState, _, privateOK := reorgPrivateParent(parentSlot); privateOK {
 				beaconState = privateState
