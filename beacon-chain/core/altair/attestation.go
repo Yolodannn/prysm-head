@@ -332,7 +332,7 @@ func AttestationParticipationFlagIndices(beaconState state.ReadOnlyBeaconState, 
 		participatedFlags[headFlagIndex] = true
 	}
 
-	if experimentPartialHeadRewardEnabled() && matchedSrcTgt && matchingPayload && delay == cfg.MinAttestationInclusionDelay {
+	if experimentPartialHeadRewardEnabled() && matchedSrcTgt && delay == cfg.MinAttestationInclusionDelay {
 		weightBps, ok, err := experimentPartialHeadWeightBpsForData(beaconState, data)
 		if err != nil {
 			return nil, 0, err
