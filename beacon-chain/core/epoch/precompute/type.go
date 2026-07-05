@@ -26,6 +26,9 @@ type Validator struct {
 	IsPrevEpochTargetAttester bool
 	// IsPrevEpochHeadAttester is true if the validator attested the previous epoch head.
 	IsPrevEpochHeadAttester bool
+	// ExperimentPrevEpochHeadWeightBps stores the experimental partial-head reward weight in basis points.
+	// 10000 means full head reward; 7200/5100/1400 represent stale head distances 1/2/3.
+	ExperimentPrevEpochHeadWeightBps uint64
 
 	// CurrentEpochEffectiveBalance is how much effective balance this validator has current epoch.
 	CurrentEpochEffectiveBalance uint64

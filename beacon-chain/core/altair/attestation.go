@@ -63,7 +63,7 @@ func ProcessAttestationNoVerifySignature(
 	if err != nil {
 		return nil, fmt.Errorf("att slot %d can't be greater than state slot %d", att.GetData().Slot, beaconState.Slot())
 	}
-	participatedFlags, err := AttestationParticipationFlagIndices(beaconState, att.GetData(), delay)
+	participatedFlags, _, err := AttestationParticipationFlagIndices(beaconState, att.GetData(), delay)
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +274,7 @@ func RewardProposer(ctx context.Context, beaconState state.BeaconState, proposer
 //	    participation_flag_indices.append(TIMELY_HEAD_FLAG_INDEX)
 //
 //	return participation_flag_indices
-func AttestationParticipationFlagIndices(beaconState state.ReadOnlyBeaconState, data *ethpb.AttestationData, delay primitives.Slot) (map[uint8]bool, error) {
+func AttestationParticipationFlagIndices(beaconState state.ReadOnlyBeaconState, data *ethpb.AttestationData, delay primitives.Slot) (map[uint8]bool, uint64, error) {
 	currEpoch := time.CurrentEpoch(beaconState)
 	var justifiedCheckpt *ethpb.Checkpoint
 	if data.Target.Epoch == currEpoch {
@@ -285,13 +285,15 @@ func AttestationParticipationFlagIndices(beaconState state.ReadOnlyBeaconState, 
 
 	matchedSrc, matchedTgt, matchedHead, err := MatchingStatus(beaconState, data, justifiedCheckpt)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if !matchedSrc {
-		return nil, errors.New("source epoch does not match")
+		return nil, 0, errors.New("source epoch does not match")
 	}
 
 	participatedFlags := make(map[uint8]bool)
+	partialHeadWeightBps := uint64(0)
+
 	cfg := params.BeaconConfig()
 	sourceFlagIndex := cfg.TimelySourceFlagIndex
 	targetFlagIndex := cfg.TimelyTargetFlagIndex
@@ -316,13 +318,25 @@ func AttestationParticipationFlagIndices(beaconState state.ReadOnlyBeaconState, 
 		uint64(data.CommitteeIndex),
 	)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+
 	matchedSrcTgtHead = matchedSrcTgtHead && matchingPayload
 	if matchedSrcTgtHead && delay == cfg.MinAttestationInclusionDelay {
 		participatedFlags[headFlagIndex] = true
 	}
-	return participatedFlags, nil
+
+	if experimentPartialHeadRewardEnabled() && matchedSrcTgt && matchingPayload && delay == cfg.MinAttestationInclusionDelay {
+		weightBps, ok, err := experimentPartialHeadWeightBpsForData(beaconState, data)
+		if err != nil {
+			return nil, 0, err
+		}
+		if ok {
+			partialHeadWeightBps = weightBps
+		}
+	}
+
+	return participatedFlags, partialHeadWeightBps, nil
 }
 
 // MatchingStatus returns the matching statues for attestation data's source target and head.
