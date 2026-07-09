@@ -10,6 +10,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/time"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
 	"github.com/OffchainLabs/prysm/v7/config/params"
+	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	"github.com/OffchainLabs/prysm/v7/math"
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
 	"github.com/pkg/errors"
@@ -224,6 +225,20 @@ func ProcessEpochParticipation(
 			vals[i].IsPrevEpochHeadAttester = true
 		}
 	}
+	if experimentPartialHeadRewardEnabled() {
+		prevEpoch := time.PrevEpoch(beaconState)
+		for i := range vals {
+			if !vals[i].IsActivePrevEpoch {
+				continue
+			}
+			if weightBps, ok := experimentLookupPartialHeadReward(prevEpoch, primitives.ValidatorIndex(i)); ok && weightBps > 0 {
+				vals[i].IsPrevEpochHeadAttester = true
+				vals[i].ExperimentPrevEpochHeadWeightBps = weightBps
+			} else if vals[i].IsPrevEpochHeadAttester {
+				vals[i].ExperimentPrevEpochHeadWeightBps = experimentHeadWeightBpsForDistance(0)
+			}
+		}
+	}
 	bal = precompute.UpdateBalance(vals, bal, beaconState.Version())
 	return vals, bal, nil
 }
@@ -356,7 +371,15 @@ func attestationDelta(
 	if val.IsPrevEpochHeadAttester && !val.IsSlashed {
 		if !inactivityLeak {
 			n := baseReward * headWeight * (bal.PrevEpochHeadAttested / increment)
-			attDelta.HeadReward += n / (activeIncrement * weightDenominator)
+			headReward := n / (activeIncrement * weightDenominator)
+			if experimentPartialHeadRewardEnabled() {
+				weightBps := val.ExperimentPrevEpochHeadWeightBps
+				if weightBps == 0 {
+					weightBps = experimentHeadWeightBpsForDistance(0)
+				}
+				headReward = headReward * weightBps / experimentPartialHeadRewardDenominatorBps
+			}
+			attDelta.HeadReward += headReward
 		}
 	}
 
