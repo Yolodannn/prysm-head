@@ -25,7 +25,7 @@ func experimentPrivateBlocksPath() string {
 	if p := strings.TrimSpace(os.Getenv("EXPERIMENT_PRIVATE_BLOCKS_PATH")); p != "" {
 		return p
 	}
-	return "/home/suliudan2001/workspace/devnet/private_blocks.csv"
+	return "private_blocks.csv"
 }
 
 func experimentRecordPrivateBlock(slot primitives.Slot, root [fieldparams.RootLength]byte, releaseTime time.Time) error {

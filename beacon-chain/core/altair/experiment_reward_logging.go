@@ -16,7 +16,14 @@ import (
 	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
 )
 
-const experimentRewardCSVPath = "/home/suliudan2001/workspace/devnet/rewards.csv"
+const defaultExperimentRewardCSVPath = "rewards.csv"
+
+func experimentRewardCSVPath() string {
+	if p := os.Getenv("EXPERIMENT_REWARDS_CSV"); p != "" {
+		return p
+	}
+	return defaultExperimentRewardCSVPath
+}
 
 var experimentRewardStartupLogOnce sync.Once
 
@@ -27,7 +34,7 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 	if os.Getenv("EXPERIMENT_WRITE_REWARDS") != "1" {
 		return
 	}
-
+	rewardCSVPath := experimentRewardCSVPath()
 	if len(vals) != len(deltas) {
 		log.WithFields(map[string]any{
 			"validators": len(vals),
@@ -41,14 +48,14 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 		log.Info(experiment.StartupLog(totalValidators))
 	})
 
-	if err := file.MkdirAll(filepath.Dir(experimentRewardCSVPath)); err != nil {
+	if err := file.MkdirAll(filepath.Dir(rewardCSVPath)); err != nil {
 		log.WithError(err).Error("EXPERIMENT: could not create reward CSV directory")
 		return
 	}
 
-	info, statErr := os.Stat(experimentRewardCSVPath)
+	info, statErr := os.Stat(rewardCSVPath)
 	newFile := os.IsNotExist(statErr) || (statErr == nil && info.Size() == 0)
-	f, err := os.OpenFile(experimentRewardCSVPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(rewardCSVPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		log.WithError(err).Error("EXPERIMENT: could not open reward CSV")
 		return
@@ -60,9 +67,9 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 	}()
 
 	if newFile {
-		log.WithField("path", experimentRewardCSVPath).Info("EXPERIMENT: reward CSV created/opened")
+		log.WithField("path", rewardCSVPath).Info("EXPERIMENT: reward CSV created/opened")
 	} else {
-		log.WithField("path", experimentRewardCSVPath).Info("EXPERIMENT: reward CSV opened")
+		log.WithField("path", rewardCSVPath).Info("EXPERIMENT: reward CSV opened")
 	}
 
 	w := csv.NewWriter(f)
@@ -105,7 +112,7 @@ func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*pre
 	}
 
 	log.WithFields(map[string]any{
-		"path":  experimentRewardCSVPath,
+		"path":  rewardCSVPath,
 		"epoch": epoch,
 		"rows":  rows,
 	}).Info("EXPERIMENT: epoch rewards written")
