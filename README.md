@@ -1,68 +1,241 @@
-<h1 align="left">Prysm: An Ethereum Consensus Implementation Written in Go</h1>
+# Delay-4s Private-Head Experiment
 
-<div align="left">
-  
-[![Build status](https://badge.buildkite.com/b555891daf3614bae4284dcf365b2340cefc0089839526f096.svg?branch=master)](https://buildkite.com/prysmatic-labs/prysm)
-[![Go Report Card](https://goreportcard.com/badge/github.com/OffchainLabs/prysm)](https://goreportcard.com/report/github.com/OffchainLabs/prysm)
-[![Consensus_Spec_Version 1.4.0](https://img.shields.io/badge/Consensus%20Spec%20Version-v1.4.0-blue.svg)](https://github.com/ethereum/consensus-specs/tree/v1.4.0)
-[![Execution_API_Version 1.0.0-beta.2](https://img.shields.io/badge/Execution%20API%20Version-v1.0.0.beta.2-blue.svg)](https://github.com/ethereum/execution-apis/tree/v1.0.0-beta.2/src/engine)
-[![Discord](https://user-images.githubusercontent.com/7288322/34471967-1df7808a-efbb-11e7-9088-ed0b04151291.png)](https://discord.gg/qEZK94mFXP)
-[![GitPOAP Badge](https://public-api.gitpoap.io/v1/repo/OffchainLabs/prysm/badge)](https://www.gitpoap.io/gh/OffchainLabs/prysm)
+This artifact implements the 4-second delayed proposer attack with asymmetric block visibility.
 
-</div>
+## Setup
 
----
+The experiment uses one beacon node and two validator clients connected to the same beacon node.
 
-## 📖 Overview
+- Honest validator client: `EXPERIMENT_VALIDATOR_ROLE=honest`
+- Byzantine validator client: `EXPERIMENT_VALIDATOR_ROLE=byzantine`
 
-This is the core repository for Prysm, a [Golang](https://go.dev/) implementation of the [Ethereum Consensus](https://ethereum.org/en/developers/docs/consensus-mechanisms/#proof-of-stake) [specification](https://github.com/ethereum/consensus-specs), developed by [Offchain Labs](https://www.offchainlabs.com).
+The experiment contains 1000 validators in total:
 
-See the [Changelog](https://github.com/OffchainLabs/prysm/releases) for details of the latest releases and upcoming breaking changes.
+- Byzantine validators: indices 0-332 (333 validators)
+- Honest validators: indices 333-999 (667 validators)
 
----
+The experiment starts from the Altair fork.
 
-## 🚀 Getting Started
+## Attack behavior
 
-A detailed set of installation and usage instructions as well as breakdowns of each individual component are available in the **[official documentation portal](https://prysm.offchainlabs.com/docs/)**.
+When the proposer is Byzantine:
 
-💬 **Need help?** Join our **[Discord Community](https://discord.gg/qEZK94mFXP)** for support (this invite link never expires).
+1. the validator client builds and signs the block normally;
+2. the block root is recorded into `private_blocks.csv`;
+3. the proposer waits for 4 seconds;
+4. the block is submitted to the beacon node.
 
----
+When an attester is Byzantine:
 
-## 🏆 Staking on Mainnet
+1. the validator client requests normal attestation data from the beacon node;
+2. if a private block exists for the current slot, the attester replaces `BeaconBlockRoot` with the private block root;
+3. the attestation is submitted after the delayed block is publicly released.
 
-To participate in staking, you can join the **[official Ethereum launchpad](https://launchpad.ethereum.org)**. The launchpad is the **only recommended** way to become a validator on mainnet.
+This simulates a private view for Byzantine validators while keeping a single canonical beacon chain.
 
-🔍 Explore validator rewards/penalties:
+## Expected result
 
-- **[beaconcha.in](https://beaconcha.in)**
-- **[beaconscan](https://beaconscan.com)**
+Honest validators:
 
----
+- source reward remains normal;
+- target reward remains normal;
+- head reward loss increases.
 
-## 🤝 Contributing
+Byzantine validators:
 
-### 🔥 Branches
+- source reward remains normal;
+- target reward remains normal;
+- head reward is mostly preserved.
 
-Prysm maintains two permanent branches:
+## Important files
 
-- **[`master`](https://github.com/OffchainLabs/prysm/tree/master)** - This points to the latest stable release. It is ideal for most users.
-- **[`develop`](https://github.com/OffchainLabs/prysm/tree/develop)** - This is used for development and contains the latest PRs. Developers should base their PRs on this branch.
+The experiment configuration is stored in:
 
-### 🛠 Contribution Guide
+    experiments/delay-4s/devnet_config.yaml
 
-Want to get involved? Check out our **[Contribution Guide](https://prysm.offchainlabs.com/docs/contribute/contribution-guidelines/)** to learn more!
+The Byzantine validator set is stored in:
 
----
+    experiments/delay-4s/groups/byz_333_first.txt
 
-## 📜 License
+The environment configuration for the 333-Byzantine partial-head-reward experiment is:
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0.en.html)  
+    experiments/delay-4s/env/333byz-partial.env
 
-This project is licensed under the **GNU General Public License v3.0**.
+The complete experiment launcher is:
 
----
+    experiments/delay-4s/scripts/run_333_partial.sh
 
-## ⚖️ Legal Disclaimer
+## Build
 
-📜 [Terms of Use](/TERMS_OF_SERVICE.md)
+Run the following commands from the root directory of the repository.
+
+Build `prysmctl`, the beacon node, and the validator client:
+
+    bazel build \
+      //cmd/prysmctl:prysmctl \
+      //cmd/beacon-chain:beacon-chain \
+      //cmd/validator:validator
+
+The experiment launcher expects the generated binaries at:
+
+    bazel-bin/cmd/prysmctl/prysmctl_/prysmctl
+    bazel-bin/cmd/beacon-chain/beacon-chain_/beacon-chain
+    bazel-bin/cmd/validator/validator_/validator
+
+## Run the experiment
+
+Make the launcher executable:
+
+    chmod +x experiments/delay-4s/scripts/run_333_partial.sh
+
+Start the complete experiment:
+
+    ./experiments/delay-4s/scripts/run_333_partial.sh
+
+The launcher automatically performs the following steps:
+
+1. generates an Altair genesis state with 1000 validators;
+2. starts the beacon node;
+3. starts the Byzantine validator client controlling validators 0-332;
+4. starts the honest validator client controlling validators 333-999;
+5. waits for the processes to initialize;
+6. checks the running processes and the current beacon-chain head.
+
+## Genesis
+
+The launcher generates the genesis state using:
+
+    --fork=altair
+    --genesis-time-delay=120
+    --num-validators=1000
+
+The generated genesis state is written to:
+
+    $BASE/genesis.ssz
+
+## Beacon node
+
+The beacon node uses the following experiment settings:
+
+    EXPERIMENT_TOTAL_VALIDATORS=1000
+    EXPERIMENT_WRITE_REWARDS=1
+    EXPERIMENT_PARTIAL_HEAD_REWARD=1
+
+Reward information is written to:
+
+    $BASE/rewards.csv
+
+Private-block information is written to:
+
+    $BASE/private_blocks.csv
+
+The beacon node exposes:
+
+    gRPC: 127.0.0.1:4000
+    REST: http://127.0.0.1:3500
+
+## Byzantine validators
+
+The Byzantine validator client controls validators 0-332:
+
+    --interop-num-validators=333
+    --interop-start-index=0
+    --monitoring-port=8082
+
+It runs with:
+
+    EXPERIMENT_VALIDATOR_ROLE=byzantine
+
+## Honest validators
+
+The honest validator client controls validators 333-999:
+
+    --interop-num-validators=667
+    --interop-start-index=333
+    --monitoring-port=8081
+
+It runs with:
+
+    EXPERIMENT_VALIDATOR_ROLE=honest
+
+## Output directory
+
+By default, the launcher stores runtime files under:
+
+    ~/workspace/devnet/delay-4s-333-partial
+
+A different output directory can be specified using `BASE`:
+
+    BASE=/path/to/output \
+      ./experiments/delay-4s/scripts/run_333_partial.sh
+
+## Experiment outputs
+
+The main experiment outputs are:
+
+    rewards.csv
+    private_blocks.csv
+    beacon.log
+    validator-byzantine.log
+    validator-honest.log
+
+The runtime directory also contains:
+
+    genesis.ssz
+    beacon-data/
+    validator-byzantine-data/
+    validator-honest-data/
+    beacon.pid
+    validator-byzantine.pid
+    validator-honest.pid
+
+The CSV files and logs should be preserved when archiving an experimental run.
+
+The database directories are runtime data and can be regenerated.
+
+## Check experiment status
+
+Check the running Prysm processes:
+
+    pgrep -af "beacon-chain_/beacon-chain|validator_/validator"
+
+Check the current beacon-chain head:
+
+    curl -s http://127.0.0.1:3500/eth/v1/beacon/headers/head \
+      | python3 -c 'import sys,json; print("slot="+json.load(sys.stdin)["data"]["header"]["message"]["slot"])'
+
+Check the beacon-node log:
+
+    tail -f ~/workspace/devnet/delay-4s-333-partial/beacon.log
+
+Check the Byzantine-validator log:
+
+    tail -f ~/workspace/devnet/delay-4s-333-partial/validator-byzantine.log
+
+Check the honest-validator log:
+
+    tail -f ~/workspace/devnet/delay-4s-333-partial/validator-honest.log
+
+## Stop the experiment
+
+Stop the beacon node:
+
+    pkill -f "beacon-chain_/beacon-chain"
+
+Stop the validator clients:
+
+    pkill -f "validator_/validator"
+
+Before starting a new experimental run, verify that no old processes remain:
+
+    pgrep -af "beacon-chain_/beacon-chain|validator_/validator"
+
+## Reproducibility
+
+The experiment source code, chain configuration, validator-group definition,
+environment configuration, and launcher are version-controlled together.
+
+For reproducibility, use the source-code version associated with this artifact
+and run:
+
+    ./experiments/delay-4s/scripts/run_333_partial.sh
