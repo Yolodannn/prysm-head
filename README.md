@@ -1,4 +1,4 @@
-# Delay-4s Private-Head Experiment
+# Delay-4s Mitigation Experiment
 
 This artifact implements the 4-second delayed proposer attack with asymmetric block visibility.
 
