@@ -1,0 +1,2040 @@
+diff --git a/beacon-chain/core/altair/BUILD.bazel b/beacon-chain/core/altair/BUILD.bazel
+index 9782a0373c..89a43fc746 100644
+--- a/beacon-chain/core/altair/BUILD.bazel
++++ b/beacon-chain/core/altair/BUILD.bazel
+@@ -7,6 +7,7 @@ go_library(
+         "block.go",
+         "deposit.go",
+         "epoch_precompute.go",
++        "experiment_reward_logging.go",
+         "epoch_spec.go",
+         "log.go",
+         "reward.go",
+@@ -43,7 +44,9 @@ go_library(
+         "//time/slots:go_default_library",
+         "@com_github_pkg_errors//:go_default_library",
+         "@com_github_sirupsen_logrus//:go_default_library",
+-    ],
++            "//io/file:go_default_library",
++        "//runtime/experiment:go_default_library",
++],
+ )
+ 
+ go_test(
+diff --git a/beacon-chain/core/altair/epoch_precompute.go b/beacon-chain/core/altair/epoch_precompute.go
+index aa70b8f8a8..7e4317e4ad 100644
+--- a/beacon-chain/core/altair/epoch_precompute.go
++++ b/beacon-chain/core/altair/epoch_precompute.go
+@@ -238,6 +238,8 @@ func ProcessRewardsAndPenaltiesPrecompute(
+ 		return nil, errors.Wrap(err, "could not get attestation delta")
+ 	}
+ 
++	writeExperimentRewardCSV(beaconState, vals, attDeltas)
++
+ 	balances := beaconState.Balances()
+ 	for i := range numOfVals {
+ 		vals[i].BeforeEpochTransitionBalance = balances[i]
+diff --git a/beacon-chain/core/altair/experiment_reward_logging.go b/beacon-chain/core/altair/experiment_reward_logging.go
+new file mode 100644
+index 0000000000..f394e67403
+--- /dev/null
++++ b/beacon-chain/core/altair/experiment_reward_logging.go
+@@ -0,0 +1,140 @@
++package altair
++
++import (
++	"encoding/csv"
++	"os"
++	"path/filepath"
++	"strconv"
++	"sync"
++
++	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/epoch/precompute"
++	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/time"
++	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
++	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
++	"github.com/OffchainLabs/prysm/v7/io/file"
++	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
++)
++
++const defaultExperimentRewardCSVPath = "/tmp/prysm-rewards.csv"
++
++func experimentRewardCSVPath() string {
++	if path := os.Getenv("EXPERIMENT_REWARDS_CSV"); path != "" {
++		return path
++	}
++	return defaultExperimentRewardCSVPath
++}
++
++var experimentRewardStartupLogOnce sync.Once
++
++var experimentRewardCSVSeen = struct {
++	sync.Mutex
++	seen map[string]struct{}
++}{
++	seen: make(map[string]struct{}),
++}
++
++func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*precompute.Validator, deltas []*AttDelta) {
++	if os.Getenv("EXPERIMENT_WRITE_REWARDS") != "1" {
++		return
++	}
++
++	if len(vals) != len(deltas) {
++		log.WithFields(map[string]any{
++			"validators": len(vals),
++			"deltas":     len(deltas),
++		}).Error("EXPERIMENT: reward CSV skipped because validator and delta lengths differ")
++		return
++	}
++
++	totalValidators := uint64(beaconState.NumValidators())
++	experimentRewardStartupLogOnce.Do(func() {
++		log.Info(experiment.StartupLog(totalValidators))
++	})
++
++	if err := file.MkdirAll(filepath.Dir(experimentRewardCSVPath())); err != nil {
++		log.WithError(err).Error("EXPERIMENT: could not create reward CSV directory")
++		return
++	}
++
++	info, statErr := os.Stat(experimentRewardCSVPath())
++	newFile := os.IsNotExist(statErr) || (statErr == nil && info.Size() == 0)
++
++	f, err := os.OpenFile(experimentRewardCSVPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
++	if err != nil {
++		log.WithError(err).Error("EXPERIMENT: could not open reward CSV")
++		return
++	}
++	defer func() {
++		if err := f.Close(); err != nil {
++			log.WithError(err).Error("EXPERIMENT: could not close reward CSV")
++		}
++	}()
++
++	w := csv.NewWriter(f)
++	if newFile {
++		if err := w.Write([]string{
++			"epoch",
++			"validator_index",
++			"is_malicious",
++			"malicious_fraction",
++			"source_reward",
++			"target_reward",
++			"head_reward",
++			"total_reward",
++		}); err != nil {
++			log.WithError(err).Error("EXPERIMENT: could not write reward CSV header")
++			return
++		}
++	}
++
++	epoch := time.PrevEpoch(beaconState)
++	rows := 0
++
++	for i, val := range vals {
++		if !val.IsActivePrevEpoch {
++			continue
++		}
++
++		idx := primitives.ValidatorIndex(i)
++
++		rewardCSVKey := strconv.FormatUint(uint64(epoch), 10) + "," + strconv.FormatUint(uint64(idx), 10)
++		experimentRewardCSVSeen.Lock()
++		if _, ok := experimentRewardCSVSeen.seen[rewardCSVKey]; ok {
++			experimentRewardCSVSeen.Unlock()
++			continue
++		}
++		experimentRewardCSVSeen.seen[rewardCSVKey] = struct{}{}
++		experimentRewardCSVSeen.Unlock()
++
++		delta := deltas[i]
++		total := delta.SourceReward + delta.TargetReward + delta.HeadReward
++
++		if err := w.Write([]string{
++			strconv.FormatUint(uint64(epoch), 10),
++			strconv.FormatUint(uint64(idx), 10),
++			strconv.FormatBool(experiment.IsMaliciousValidator(uint64(idx), 0)),
++			experiment.MaliciousFractionString(),
++			strconv.FormatUint(delta.SourceReward, 10),
++			strconv.FormatUint(delta.TargetReward, 10),
++			strconv.FormatUint(delta.HeadReward, 10),
++			strconv.FormatUint(total, 10),
++		}); err != nil {
++			log.WithError(err).Error("EXPERIMENT: could not write reward CSV row")
++			return
++		}
++
++		rows++
++	}
++
++	w.Flush()
++	if err := w.Error(); err != nil {
++		log.WithError(err).Error("EXPERIMENT: could not flush reward CSV")
++		return
++	}
++
++	log.WithFields(map[string]any{
++		"path":  experimentRewardCSVPath(),
++		"epoch": epoch,
++		"rows":  rows,
++	}).Info("EXPERIMENT: epoch rewards written")
++}
+diff --git a/beacon-chain/rpc/prysm/v1alpha1/validator/BUILD.bazel b/beacon-chain/rpc/prysm/v1alpha1/validator/BUILD.bazel
+index 2f3f6650eb..adfc997bb6 100644
+--- a/beacon-chain/rpc/prysm/v1alpha1/validator/BUILD.bazel
++++ b/beacon-chain/rpc/prysm/v1alpha1/validator/BUILD.bazel
+@@ -42,6 +42,7 @@ go_library(
+     importpath = "github.com/OffchainLabs/prysm/v7/beacon-chain/rpc/prysm/v1alpha1/validator",
+     visibility = ["//beacon-chain:__subpackages__"],
+     deps = [
++        "//runtime/experiment:go_default_library",
+         "//api/client/builder:go_default_library",
+         "//async/event:go_default_library",
+         "//beacon-chain/blockchain:go_default_library",
+diff --git a/beacon-chain/rpc/prysm/v1alpha1/validator/proposer.go b/beacon-chain/rpc/prysm/v1alpha1/validator/proposer.go
+index f4946120c5..a82872cf8d 100644
+--- a/beacon-chain/rpc/prysm/v1alpha1/validator/proposer.go
++++ b/beacon-chain/rpc/prysm/v1alpha1/validator/proposer.go
+@@ -27,6 +27,7 @@ import (
+ 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
+ 	enginev1 "github.com/OffchainLabs/prysm/v7/proto/engine/v1"
+ 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
++	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
+ 	"github.com/OffchainLabs/prysm/v7/runtime/version"
+ 	"github.com/OffchainLabs/prysm/v7/time/slots"
+ 	"github.com/ethereum/go-ethereum/common"
+@@ -42,6 +43,243 @@ import (
+ // eth1DataNotification is a latch to stop flooding logs with the same warning.
+ var eth1DataNotification bool
+ 
++func reorgBeaconLogFields(phase string, w experiment.ReorgWindow) logrus.Fields {
++	return logrus.Fields{
++		"phase":                   phase,
++		"epoch":                   w.Epoch,
++		"startSlot":               w.StartSlot,
++		"privateSlot1":            w.PrivateSlot1,
++		"privateSlot2":            w.PrivateSlot2,
++		"privateSlot3":            w.PrivateSlot3,
++		"isolatedHonestSlot1":     w.IsolatedHonestSlot1,
++		"isolatedHonestSlot2":     w.IsolatedHonestSlot2,
++		"releaseSlot":             w.ReleaseSlot,
++		"byzProposer1":            w.ByzProposer1,
++		"byzProposer2":            w.ByzProposer2,
++		"byzProposer3":            w.ByzProposer3,
++		"isolatedHonestProposer1": w.IsolatedHonestProposer1,
++		"isolatedHonestProposer2": w.IsolatedHonestProposer2,
++	}
++}
++
++type reorgPrivateBlock struct {
++	block     interfaces.SignedBeaconBlock
++	root      [fieldparams.RootLength]byte
++	postState state.BeaconState
++}
++
++var reorgPrivateBlocks = struct {
++	sync.Mutex
++	bySlot           map[uint64]reorgPrivateBlock
++	released         map[uint64]bool
++	releaseScheduled map[uint64]bool
++	isolatedRoots    map[uint64]string
++}{
++	bySlot:           make(map[uint64]reorgPrivateBlock),
++	released:         make(map[uint64]bool),
++	releaseScheduled: make(map[uint64]bool),
++	isolatedRoots:    make(map[uint64]string),
++}
++
++func reorgStorePrivateBlock(slot uint64, block interfaces.SignedBeaconBlock, root [fieldparams.RootLength]byte, postState state.BeaconState) {
++	reorgPrivateBlocks.Lock()
++	defer reorgPrivateBlocks.Unlock()
++
++	reorgPrivateBlocks.bySlot[slot] = reorgPrivateBlock{
++		block:     block,
++		root:      root,
++		postState: postState,
++	}
++}
++
++func reorgLoadPrivateBlock(slot uint64) (reorgPrivateBlock, bool) {
++	reorgPrivateBlocks.Lock()
++	defer reorgPrivateBlocks.Unlock()
++
++	b, ok := reorgPrivateBlocks.bySlot[slot]
++	return b, ok
++}
++
++func reorgStoreIsolatedRoot(slot uint64, root string) {
++	reorgPrivateBlocks.Lock()
++	defer reorgPrivateBlocks.Unlock()
++
++	reorgPrivateBlocks.isolatedRoots[slot] = root
++}
++
++func reorgLoadIsolatedRoot(slot uint64) string {
++	reorgPrivateBlocks.Lock()
++	defer reorgPrivateBlocks.Unlock()
++
++	return reorgPrivateBlocks.isolatedRoots[slot]
++}
++
++func reorgRootString(root [fieldparams.RootLength]byte) string {
++	return fmt.Sprintf("%#x", root)
++}
++
++func reorgPrivateParent(slot uint64) (state.BeaconState, [fieldparams.RootLength]byte, bool) {
++	reorgPrivateBlocks.Lock()
++	defer reorgPrivateBlocks.Unlock()
++
++	b, ok := reorgPrivateBlocks.bySlot[slot]
++	if !ok || b.postState == nil {
++		return nil, [fieldparams.RootLength]byte{}, false
++	}
++	return b.postState.Copy(), b.root, true
++}
++
++func reorgAlreadyReleased(startSlot uint64) bool {
++	reorgPrivateBlocks.Lock()
++	defer reorgPrivateBlocks.Unlock()
++
++	return reorgPrivateBlocks.released[startSlot]
++}
++
++func reorgMarkReleased(startSlot uint64) {
++	reorgPrivateBlocks.Lock()
++	defer reorgPrivateBlocks.Unlock()
++
++	reorgPrivateBlocks.released[startSlot] = true
++}
++
++func reorgMarkReleaseScheduled(startSlot uint64) bool {
++	reorgPrivateBlocks.Lock()
++	defer reorgPrivateBlocks.Unlock()
++
++	if reorgPrivateBlocks.released[startSlot] || reorgPrivateBlocks.releaseScheduled[startSlot] {
++		return false
++	}
++	reorgPrivateBlocks.releaseScheduled[startSlot] = true
++	return true
++}
++
++func (vs *Server) reorgScheduleTimedRelease(w experiment.ReorgWindow, releaseAt time.Time) {
++	if !reorgMarkReleaseScheduled(w.StartSlot) {
++		return
++	}
++
++	delay := max(time.Until(releaseAt), 0)
++
++	log.WithFields(reorgBeaconLogFields("isolated_honest_slot_2", w)).WithFields(logrus.Fields{
++		"releaseAt": releaseAt,
++		"delay":     delay.String(),
++	}).Warn("[REORG] Scheduled timed release at second isolated slot +9s")
++
++	go func() {
++		timer := time.NewTimer(delay)
++		defer timer.Stop()
++
++		<-timer.C
++
++		if err := vs.reorgReleasePrivateBlocks(context.Background(), w); err != nil {
++			log.WithError(err).WithFields(reorgBeaconLogFields("timed_release", w)).Warn("[REORG] Timed release failed")
++			return
++		}
++
++		log.WithFields(reorgBeaconLogFields("timed_release", w)).Warn("[REORG] Timed release completed")
++	}()
++}
++
++func (vs *Server) reorgReleasePrivateBlocks(ctx context.Context, w experiment.ReorgWindow) error {
++	if reorgAlreadyReleased(w.StartSlot) {
++		return nil
++	}
++
++	for _, slot := range []uint64{w.PrivateSlot1, w.PrivateSlot2, w.PrivateSlot3} {
++		privateBlock, ok := reorgLoadPrivateBlock(slot)
++		if !ok {
++			return fmt.Errorf("missing private block for slot %d", slot)
++		}
++
++		var wg sync.WaitGroup
++		wg.Add(1)
++		if err := vs.broadcastReceiveBlock(ctx, &wg, privateBlock.block, privateBlock.root); err != nil {
++			wg.Wait()
++			return fmt.Errorf("release private block slot %d failed: %w", slot, err)
++		}
++		wg.Wait()
++
++		log.WithFields(logrus.Fields{
++			"slot":      slot,
++			"root":      fmt.Sprintf("%#x", privateBlock.root),
++			"startSlot": w.StartSlot,
++		}).Warn("[REORG] Released and locally imported private block")
++	}
++
++	reorgMarkReleased(w.StartSlot)
++	return nil
++}
++
++func (vs *Server) reorgPrivatePreState(
++	ctx context.Context,
++	phase string,
++	w experiment.ReorgWindow,
++	block interfaces.SignedBeaconBlock,
++	root [fieldparams.RootLength]byte,
++) (state.BeaconState, error) {
++	if phase == "private_slot_2" || phase == "private_slot_3" {
++		parentSlot := w.PrivateSlot1
++		if phase == "private_slot_3" {
++			parentSlot = w.PrivateSlot2
++		}
++
++		privateState, _, ok := reorgPrivateParent(parentSlot)
++		if !ok {
++			return nil, fmt.Errorf("missing private parent state for slot %d", parentSlot)
++		}
++		return privateState, nil
++	}
++
++	roblock, err := blocks.NewROBlockWithRoot(block, root)
++	if err != nil {
++		return nil, err
++	}
++	return vs.BlockReceiver.GetPrestateToPropose(ctx, roblock)
++}
++
++func (vs *Server) reorgWithholdPrivateBlock(
++	ctx context.Context,
++	phase string,
++	w experiment.ReorgWindow,
++	block interfaces.SignedBeaconBlock,
++	root [fieldparams.RootLength]byte,
++) (*ethpb.ProposeResponse, error) {
++	preState, err := vs.reorgPrivatePreState(ctx, phase, w, block, root)
++	if err != nil {
++		return nil, status.Errorf(codes.Internal, "could not get private pre-state: %v", err)
++	}
++
++	postState, err := transition.ExecuteStateTransition(ctx, preState, block)
++	if err != nil {
++		return nil, status.Errorf(codes.Internal, "could not execute private state transition: %v", err)
++	}
++
++	slot := uint64(block.Block().Slot())
++	reorgStorePrivateBlock(slot, block, root, postState)
++
++	if experiment.ShouldWriteReorgPrivateRoots() {
++		if err := experiment.AppendReorgPrivateRoot(experiment.ReorgPrivateRoot{
++			Epoch:     w.Epoch,
++			StartSlot: w.StartSlot,
++			Slot:      uint64(block.Block().Slot()),
++			Phase:     phase,
++			BlockRoot: reorgRootString(root),
++		}); err != nil {
++			log.WithError(err).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Failed to write private root")
++		}
++	}
++	log.WithFields(logrus.Fields{
++		"slot":       slot,
++		"phase":      phase,
++		"root":       fmt.Sprintf("%#x", root),
++		"parentRoot": fmt.Sprintf("%#x", block.Block().ParentRoot()),
++		"startSlot":  w.StartSlot,
++	}).Warn("[REORG] Withheld private block")
++
++	return &ethpb.ProposeResponse{BlockRoot: root[:]}, nil
++}
++
+ const (
+ 	eth1dataTimeout           = 2 * time.Second
+ 	defaultBuilderBoostFactor = primitives.Gwei(100)
+@@ -62,18 +300,16 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
+ 	}
+ 
+ 	log := log.WithField("slot", req.Slot)
+-	log.WithField("sinceSlotStartTime", time.Since(t)).Info("Begin building block")
+-
+-	// A syncing validator should not produce a block.
+-	if vs.SyncChecker.Syncing() {
+-		log.Error("Fail to build block: node is syncing")
+-		return nil, status.Error(codes.Unavailable, "Syncing to latest head, not ready to respond")
+-	}
+-	// An optimistic validator MUST NOT produce a block (i.e., sign across the DOMAIN_BEACON_PROPOSER domain).
+-	if slots.ToEpoch(req.Slot) >= params.BeaconConfig().BellatrixForkEpoch {
+-		if err := vs.optimisticStatus(ctx); err != nil {
+-			log.WithError(err).Error("Fail to build block: node is optimistic")
+-			return nil, status.Errorf(codes.Unavailable, "Validator is not ready to propose: %v", err)
++	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(req.Slot)); err != nil {
++		log.WithError(err).Warn("[REORG] Beacon failed to read scheduled reorg windows")
++	} else if ok {
++		log.WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Beacon GetBeaconBlock matched scheduled phase")
++		if phase == "isolated_honest_slot_2" {
++			vs.reorgScheduleTimedRelease(w, t.Add(9*time.Second))
++		} else if phase == "release_slot" {
++			if err := vs.reorgReleasePrivateBlocks(ctx, w); err != nil {
++				log.WithError(err).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Failed to release private blocks")
++			}
+ 		}
+ 	}
+ 
+@@ -82,6 +318,30 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
+ 		log.WithError(err).Error("Fail to build block: could not get parent state")
+ 		return nil, err
+ 	}
++
++	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(req.Slot)); err != nil {
++		log.WithError(err).Warn("[REORG] Beacon failed to read scheduled reorg windows")
++	} else if ok && (phase == "private_slot_2" || phase == "private_slot_3") {
++		parentSlot := w.PrivateSlot1
++		if phase == "private_slot_3" {
++			parentSlot = w.PrivateSlot2
++		}
++
++		if privateState, privateRoot, ok := reorgPrivateParent(parentSlot); ok {
++			if privateState.Slot() < req.Slot {
++				privateState, err = transition.ProcessSlots(ctx, privateState, req.Slot)
++				if err != nil {
++					log.WithError(err).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Failed to advance private parent state")
++					return nil, status.Errorf(codes.Internal, "could not advance private parent state: %v", err)
++				}
++			}
++			head = privateState
++			parentRoot = privateRoot
++			log.WithFields(reorgBeaconLogFields(phase, w)).WithField("privateParentRoot", fmt.Sprintf("%#x", parentRoot)).Warn("[REORG] Building block on private parent")
++		} else {
++			log.WithFields(reorgBeaconLogFields(phase, w)).WithField("privateParentSlot", parentSlot).Warn("[REORG] Missing private parent; falling back to public head")
++		}
++	}
+ 	sBlk, err := getEmptyBlock(req.Slot)
+ 	if err != nil {
+ 		log.WithError(err).Error("Fail to build block: could not get empty block")
+@@ -340,6 +600,14 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
+ 	if err != nil {
+ 		return nil, status.Errorf(codes.Internal, "Could not hash tree root: %v", err)
+ 	}
++	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(block.Block().Slot())); err != nil {
++		log.WithError(err).WithField("slot", block.Block().Slot()).Warn("[REORG] Beacon failed to read scheduled reorg windows")
++	} else if ok {
++		log.WithField("slot", block.Block().Slot()).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Beacon ProposeBeaconBlock matched scheduled phase")
++		if phase == "isolated_honest_slot_1" || phase == "isolated_honest_slot_2" {
++			reorgStoreIsolatedRoot(uint64(block.Block().Slot()), reorgRootString(root))
++		}
++	}
+ 
+ 	// For post-Fulu blinded blocks, submit to relay and return early
+ 	if block.IsBlinded() && slots.ToEpoch(block.Block().Slot()) >= params.BeaconConfig().FuluForkEpoch {
+@@ -364,6 +632,83 @@ func (vs *Server) ProposeBeaconBlock(ctx context.Context, req *ethpb.GenericSign
+ 		return nil, status.Errorf(codes.Internal, "%s: %v", "handle block failed", err)
+ 	}
+ 
++	if phase, w, ok, err := experiment.ReorgPhaseForSlot(uint64(block.Block().Slot())); err != nil {
++		log.WithError(err).WithField("slot", block.Block().Slot()).Warn("[REORG] Beacon failed to read scheduled reorg windows")
++	} else if ok && (phase == "private_slot_1" || phase == "private_slot_2" || phase == "private_slot_3") {
++		return vs.reorgWithholdPrivateBlock(ctx, phase, w, block, root)
++	} else if ok && phase == "release_slot" {
++		private1, ok1 := reorgLoadPrivateBlock(w.PrivateSlot1)
++		private2, ok2 := reorgLoadPrivateBlock(w.PrivateSlot2)
++		private3, ok3 := reorgLoadPrivateBlock(w.PrivateSlot3)
++
++		privateRoot1 := ""
++		privateRoot2 := ""
++		privateRoot3 := ""
++		if ok1 {
++			privateRoot1 = reorgRootString(private1.root)
++		}
++		if ok2 {
++			privateRoot2 = reorgRootString(private2.root)
++		}
++		if ok3 {
++			privateRoot3 = reorgRootString(private3.root)
++		}
++
++		releaseBlockRoot := reorgRootString(root)
++		releaseParentRoot := fmt.Sprintf("%#x", block.Block().ParentRoot())
++		isolatedRoot1 := reorgLoadIsolatedRoot(w.IsolatedHonestSlot1)
++		isolatedRoot2 := reorgLoadIsolatedRoot(w.IsolatedHonestSlot2)
++
++		success := "false"
++		reason := "release_parent_not_private_slot_3"
++		if !ok1 {
++			reason = "missing_private_slot_1"
++		} else if !ok2 {
++			reason = "missing_private_slot_2"
++		} else if !ok3 {
++			reason = "missing_private_slot_3"
++		} else if releaseParentRoot == privateRoot3 {
++			success = "true"
++			reason = "release_parent_matches_private_slot_3"
++		}
++
++		if experiment.ShouldWriteReorgResults() {
++			if err := experiment.AppendReorgResult(experiment.ReorgResult{
++				Epoch:               w.Epoch,
++				StartSlot:           w.StartSlot,
++				PrivateSlot1:        w.PrivateSlot1,
++				PrivateSlot2:        w.PrivateSlot2,
++				PrivateSlot3:        w.PrivateSlot3,
++				IsolatedHonestSlot1: w.IsolatedHonestSlot1,
++				IsolatedHonestSlot2: w.IsolatedHonestSlot2,
++				ReleaseSlot:         w.ReleaseSlot,
++				PrivateRoot1:        privateRoot1,
++				PrivateRoot2:        privateRoot2,
++				PrivateRoot3:        privateRoot3,
++				IsolatedHonestRoot1: isolatedRoot1,
++				IsolatedHonestRoot2: isolatedRoot2,
++				ReleaseBlockRoot:    releaseBlockRoot,
++				ReleaseParentRoot:   releaseParentRoot,
++				Success:             success,
++				Reason:              reason,
++			}); err != nil {
++				log.WithError(err).WithFields(reorgBeaconLogFields(phase, w)).Warn("[REORG] Failed to write reorg result")
++			}
++		}
++
++		log.WithFields(reorgBeaconLogFields(phase, w)).WithFields(logrus.Fields{
++			"privateRoot1":      privateRoot1,
++			"privateRoot2":      privateRoot2,
++			"privateRoot3":      privateRoot3,
++			"isolatedRoot1":     isolatedRoot1,
++			"isolatedRoot2":     isolatedRoot2,
++			"releaseBlockRoot":  releaseBlockRoot,
++			"releaseParentRoot": releaseParentRoot,
++			"success":           success,
++			"reason":            reason,
++		}).Warn("[REORG] Recorded reorg result")
++	}
++
+ 	var wg sync.WaitGroup
+ 	errChan := make(chan error, 1)
+ 
+@@ -654,7 +999,19 @@ func (vs *Server) computeStateRoot(ctx context.Context, block interfaces.SignedB
+ 	}
+ 	beaconState, err := vs.BlockReceiver.GetPrestateToPropose(ctx, roblock)
+ 	if err != nil {
+-		return nil, errors.Wrap(err, "could not retrieve beacon state")
++		if phase, w, ok, phaseErr := experiment.ReorgPhaseForSlot(uint64(block.Block().Slot())); phaseErr == nil && ok && (phase == "private_slot_2" || phase == "private_slot_3") {
++			parentSlot := w.PrivateSlot1
++			if phase == "private_slot_3" {
++				parentSlot = w.PrivateSlot2
++			}
++			if privateState, _, privateOK := reorgPrivateParent(parentSlot); privateOK {
++				beaconState = privateState
++				err = nil
++			}
++		}
++		if err != nil {
++			return nil, errors.Wrap(err, "could not retrieve beacon state")
++		}
+ 	}
+ 	root, err := transition.CalculateStateRoot(
+ 		ctx,
+diff --git a/runtime/experiment/BUILD.bazel b/runtime/experiment/BUILD.bazel
+new file mode 100644
+index 0000000000..54079f3834
+--- /dev/null
++++ b/runtime/experiment/BUILD.bazel
+@@ -0,0 +1,13 @@
++load("@prysm//tools/go:def.bzl", "go_library")
++
++go_library(
++    name = "go_default_library",
++    srcs = [
++        "attack.go",
++        "groups.go",
++        "reorg_events.go",
++    ],
++    importpath = "github.com/OffchainLabs/prysm/v7/runtime/experiment",
++    deps = ["//consensus-types/primitives:go_default_library"],
++    visibility = ["//visibility:public"],
++)
+diff --git a/runtime/experiment/attack.go b/runtime/experiment/attack.go
+new file mode 100644
+index 0000000000..76b5f91bbe
+--- /dev/null
++++ b/runtime/experiment/attack.go
+@@ -0,0 +1,95 @@
++package experiment
++
++import (
++	"fmt"
++	"math"
++	"os"
++	"strconv"
++	"strings"
++)
++
++const (
++	// ExperimentAttackStartEpoch controls when the experiment starts.
++	// Epochs before this are treated as baseline epochs.
++	ExperimentAttackStartEpoch = uint64(2)
++
++	// Default fraction used only when no malicious validator file is provided.
++	ExperimentMaliciousFraction = 0.333
++)
++
++func AttackMode() string {
++	mode := strings.TrimSpace(os.Getenv("EXPERIMENT_ATTACK_MODE"))
++	if mode == "" {
++		return "none"
++	}
++	return mode
++}
++
++func IsReorgMode() bool {
++	return AttackMode() == "reorg"
++}
++
++func ReorgK() uint64 {
++	raw := strings.TrimSpace(os.Getenv("EXPERIMENT_REORG_K"))
++	if raw == "" {
++		return 2
++	}
++	v, err := strconv.ParseUint(raw, 10, 64)
++	if err != nil || v == 0 {
++		return 2
++	}
++	return v
++}
++
++// MaliciousValidatorCut returns floor(totalValidators * ExperimentMaliciousFraction).
++func MaliciousValidatorCut(totalValidators uint64) uint64 {
++	if count, ok := MaliciousValidatorCountFromFile(); ok {
++		return count
++	}
++	return uint64(math.Floor(float64(totalValidators) * ExperimentMaliciousFraction))
++}
++
++func IsMaliciousValidator(validatorIndex uint64, totalValidators uint64) bool {
++	if configured, isMalicious := IsMaliciousValidatorFromFile(validatorIndex); configured {
++		return isMalicious
++	}
++
++	if totalValidators == 0 {
++		totalValidators = 1000
++	}
++
++	return validatorIndex < MaliciousValidatorCut(totalValidators)
++}
++
++func ShouldRunValidatorDuty(validatorIndex uint64) bool {
++	role := os.Getenv("EXPERIMENT_VALIDATOR_ROLE")
++
++	switch role {
++	case "", "all":
++		return true
++	case "honest":
++		return !IsMaliciousValidator(validatorIndex, 0)
++	case "byzantine":
++		return IsMaliciousValidator(validatorIndex, 0)
++	default:
++		return true
++	}
++}
++
++func MaliciousFractionString() string {
++	if fraction, ok := MaliciousFractionStringFromFile(); ok {
++		return fraction
++	}
++	return strconv.FormatFloat(ExperimentMaliciousFraction, 'f', -1, 64)
++}
++
++func StartupLog(totalValidators uint64) string {
++	return fmt.Sprintf(
++		"[EXPERIMENT]\nmode=%s\nvalidators=%d\nmalicious_fraction=%s\nmalicious_validators=%d\nreorg_k=%d",
++		AttackMode(),
++		totalValidators,
++		MaliciousFractionString(),
++		MaliciousValidatorCut(totalValidators),
++		ReorgK(),
++	)
++}
+diff --git a/runtime/experiment/groups.go b/runtime/experiment/groups.go
+new file mode 100644
+index 0000000000..cba0cd0b80
+--- /dev/null
++++ b/runtime/experiment/groups.go
+@@ -0,0 +1,166 @@
++package experiment
++
++import (
++	"bufio"
++	"fmt"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
++)
++
++var maliciousGroupOnce sync.Once
++var maliciousGroupConfigured bool
++var maliciousGroupSet map[uint64]struct{}
++var maliciousGroupCount uint64
++
++func maliciousValidatorsFilePath() string {
++	return strings.TrimSpace(os.Getenv("EXPERIMENT_MALICIOUS_VALIDATORS_FILE"))
++}
++
++func failGroupLoad(format string, args ...any) {
++	_, _ = fmt.Fprintf(os.Stderr, "[EXPERIMENT] "+format+"\n", args...)
++	os.Exit(1)
++}
++
++func loadMaliciousGroup() {
++	path := maliciousValidatorsFilePath()
++	if path == "" {
++		return
++	}
++
++	maliciousGroupConfigured = true
++	maliciousGroupSet = make(map[uint64]struct{})
++
++	f, err := os.Open(path)
++	if err != nil {
++		failGroupLoad("failed to open EXPERIMENT_MALICIOUS_VALIDATORS_FILE=%s: %v", path, err)
++	}
++
++	scanner := bufio.NewScanner(f)
++	lineNo := 0
++
++	for scanner.Scan() {
++		lineNo++
++		line := scanner.Text()
++
++		if idx := strings.Index(line, "#"); idx >= 0 {
++			line = line[:idx]
++		}
++
++		line = strings.ReplaceAll(line, ",", " ")
++		line = strings.TrimSpace(line)
++		if line == "" {
++			continue
++		}
++
++		for tok := range strings.FieldsSeq(line) {
++			if err := addMaliciousValidatorToken(tok, maliciousGroupSet); err != nil {
++				failGroupLoad("invalid validator token %q at %s:%d: %v", tok, path, lineNo, err)
++			}
++		}
++	}
++
++	if err := scanner.Err(); err != nil {
++		failGroupLoad("failed to read malicious validator file %s: %v", path, err)
++	}
++
++	if err := f.Close(); err != nil {
++		failGroupLoad("failed to close malicious validator file %s: %v", path, err)
++	}
++
++	maliciousGroupCount = uint64(len(maliciousGroupSet))
++}
++
++func addMaliciousValidatorToken(tok string, set map[uint64]struct{}) error {
++	tok = strings.TrimSpace(tok)
++	if tok == "" {
++		return nil
++	}
++
++	if strings.Contains(tok, "..") {
++		parts := strings.SplitN(tok, "..", 2)
++		return addMaliciousValidatorRange(parts[0], parts[1], set)
++	}
++
++	if strings.Contains(tok, "-") {
++		parts := strings.SplitN(tok, "-", 2)
++		return addMaliciousValidatorRange(parts[0], parts[1], set)
++	}
++
++	v, err := strconv.ParseUint(tok, 10, 64)
++	if err != nil {
++		return err
++	}
++
++	set[v] = struct{}{}
++	return nil
++}
++
++func addMaliciousValidatorRange(startStr string, endStr string, set map[uint64]struct{}) error {
++	start, err := strconv.ParseUint(strings.TrimSpace(startStr), 10, 64)
++	if err != nil {
++		return err
++	}
++
++	end, err := strconv.ParseUint(strings.TrimSpace(endStr), 10, 64)
++	if err != nil {
++		return err
++	}
++
++	if end < start {
++		return fmt.Errorf("range end %d is smaller than start %d", end, start)
++	}
++
++	for i := start; i <= end; i++ {
++		set[i] = struct{}{}
++		if i == ^uint64(0) {
++			break
++		}
++	}
++
++	return nil
++}
++
++func IsMaliciousValidatorFromFile(validatorIndex uint64) (bool, bool) {
++	maliciousGroupOnce.Do(loadMaliciousGroup)
++
++	if !maliciousGroupConfigured {
++		return false, false
++	}
++
++	_, ok := maliciousGroupSet[validatorIndex]
++	return true, ok
++}
++
++func MaliciousValidatorCountFromFile() (uint64, bool) {
++	maliciousGroupOnce.Do(loadMaliciousGroup)
++
++	if !maliciousGroupConfigured {
++		return 0, false
++	}
++
++	return maliciousGroupCount, true
++}
++
++func MaliciousFractionStringFromFile() (string, bool) {
++	count, ok := MaliciousValidatorCountFromFile()
++	if !ok {
++		return "", false
++	}
++
++	totalValidators := uint64(1000)
++	if raw := strings.TrimSpace(os.Getenv("EXPERIMENT_TOTAL_VALIDATORS")); raw != "" {
++		v, err := strconv.ParseUint(raw, 10, 64)
++		if err != nil {
++			failGroupLoad("invalid EXPERIMENT_TOTAL_VALIDATORS=%q: %v", raw, err)
++		}
++		totalValidators = v
++	}
++
++	if totalValidators == 0 {
++		return "", false
++	}
++
++	return strconv.FormatFloat(float64(count)/float64(totalValidators), 'f', -1, 64), true
++}
+diff --git a/runtime/experiment/reorg_events.go b/runtime/experiment/reorg_events.go
+new file mode 100644
+index 0000000000..a389333c13
+--- /dev/null
++++ b/runtime/experiment/reorg_events.go
+@@ -0,0 +1,542 @@
++package experiment
++
++import (
++	"encoding/csv"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++)
++
++const defaultReorgEventsPath = "/tmp/prysm-reorg-events.csv"
++
++var reorgEventsMu sync.Mutex
++
++func ReorgEventsPath() string {
++	path := strings.TrimSpace(os.Getenv("EXPERIMENT_REORG_EVENTS_PATH"))
++	if path == "" {
++		return defaultReorgEventsPath
++	}
++	return path
++}
++
++func WriteReorgEvent(
++	event string,
++	phase string,
++	slot uint64,
++	validatorIndex uint64,
++	isMalicious bool,
++	blockRoot string,
++	parentRoot string,
++	publicHeadRoot string,
++	privateHeadRoot string,
++	releaseSlot uint64,
++) {
++	if !IsReorgMode() {
++		return
++	}
++
++	reorgEventsMu.Lock()
++	defer reorgEventsMu.Unlock()
++
++	path := ReorgEventsPath()
++
++	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++		return
++	}
++
++	info, statErr := os.Stat(path)
++	newFile := os.IsNotExist(statErr) || (statErr == nil && info.Size() == 0)
++
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
++	if err != nil {
++		return
++	}
++	defer func() {
++		_ = f.Close()
++	}()
++
++	w := csv.NewWriter(f)
++
++	if newFile {
++		if err := w.Write([]string{
++			"event",
++			"phase",
++			"slot",
++			"validator_index",
++			"is_malicious",
++			"block_root",
++			"parent_root",
++			"public_head_root",
++			"private_head_root",
++			"release_slot",
++		}); err != nil {
++			return
++		}
++	}
++
++	if err := w.Write([]string{
++		event,
++		phase,
++		strconv.FormatUint(slot, 10),
++		strconv.FormatUint(validatorIndex, 10),
++		strconv.FormatBool(isMalicious),
++		blockRoot,
++		parentRoot,
++		publicHeadRoot,
++		privateHeadRoot,
++		strconv.FormatUint(releaseSlot, 10),
++	}); err != nil {
++		return
++	}
++
++	w.Flush()
++}
++
++type ReorgWindow struct {
++	Epoch uint64
++
++	StartSlot           uint64
++	PrivateSlot1        uint64
++	PrivateSlot2        uint64
++	PrivateSlot3        uint64
++	IsolatedHonestSlot1 uint64
++	IsolatedHonestSlot2 uint64
++	ReleaseSlot         uint64
++
++	ByzProposer1            uint64
++	ByzProposer2            uint64
++	ByzProposer3            uint64
++	IsolatedHonestProposer1 uint64
++	IsolatedHonestProposer2 uint64
++}
++
++func ReorgWindowsFilePath() string {
++	return strings.TrimSpace(os.Getenv("EXPERIMENT_REORG_WINDOWS_FILE"))
++}
++
++func ShouldWriteReorgWindows() bool {
++	return strings.EqualFold(strings.TrimSpace(os.Getenv("EXPERIMENT_VALIDATOR_ROLE")), "byzantine")
++}
++
++func AppendReorgWindow(w ReorgWindow) error {
++	path := ReorgWindowsFilePath()
++	if path == "" {
++		return nil
++	}
++
++	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++		return err
++	}
++
++	needHeader := false
++	if st, err := os.Stat(path); err != nil {
++		if os.IsNotExist(err) {
++			needHeader = true
++		} else {
++			return err
++		}
++	} else if st.Size() == 0 {
++		needHeader = true
++	}
++
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
++	if err != nil {
++		return err
++	}
++	defer func() {
++		_ = f.Close()
++	}()
++
++	cw := csv.NewWriter(f)
++	if needHeader {
++		if err := cw.Write([]string{
++			"epoch",
++			"start_slot",
++			"private_slot_1",
++			"private_slot_2",
++			"private_slot_3",
++			"isolated_honest_slot_1",
++			"isolated_honest_slot_2",
++			"release_slot",
++			"byz_proposer_1",
++			"byz_proposer_2",
++			"byz_proposer_3",
++			"isolated_honest_proposer_1",
++			"isolated_honest_proposer_2",
++		}); err != nil {
++			return err
++		}
++	}
++
++	if err := cw.Write([]string{
++		strconv.FormatUint(w.Epoch, 10),
++		strconv.FormatUint(w.StartSlot, 10),
++		strconv.FormatUint(w.PrivateSlot1, 10),
++		strconv.FormatUint(w.PrivateSlot2, 10),
++		strconv.FormatUint(w.PrivateSlot3, 10),
++		strconv.FormatUint(w.IsolatedHonestSlot1, 10),
++		strconv.FormatUint(w.IsolatedHonestSlot2, 10),
++		strconv.FormatUint(w.ReleaseSlot, 10),
++		strconv.FormatUint(w.ByzProposer1, 10),
++		strconv.FormatUint(w.ByzProposer2, 10),
++		strconv.FormatUint(w.ByzProposer3, 10),
++		strconv.FormatUint(w.IsolatedHonestProposer1, 10),
++		strconv.FormatUint(w.IsolatedHonestProposer2, 10),
++	}); err != nil {
++		return err
++	}
++
++	cw.Flush()
++	return cw.Error()
++}
++
++func ReadReorgWindows() ([]ReorgWindow, error) {
++	path := ReorgWindowsFilePath()
++	if path == "" {
++		return nil, nil
++	}
++
++	f, err := os.Open(path)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil, nil
++		}
++		return nil, err
++	}
++	defer func() {
++		_ = f.Close()
++	}()
++
++	rows, err := csv.NewReader(f).ReadAll()
++	if err != nil {
++		return nil, err
++	}
++
++	windows := make([]ReorgWindow, 0, len(rows))
++	for i, row := range rows {
++		if i == 0 {
++			continue
++		}
++		if len(row) < 13 {
++			continue
++		}
++
++		vals := make([]uint64, 13)
++		ok := true
++		for j := range vals {
++			v, err := strconv.ParseUint(strings.TrimSpace(row[j]), 10, 64)
++			if err != nil {
++				ok = false
++				break
++			}
++			vals[j] = v
++		}
++		if !ok {
++			continue
++		}
++
++		windows = append(windows, ReorgWindow{
++			Epoch:                   vals[0],
++			StartSlot:               vals[1],
++			PrivateSlot1:            vals[2],
++			PrivateSlot2:            vals[3],
++			PrivateSlot3:            vals[4],
++			IsolatedHonestSlot1:     vals[5],
++			IsolatedHonestSlot2:     vals[6],
++			ReleaseSlot:             vals[7],
++			ByzProposer1:            vals[8],
++			ByzProposer2:            vals[9],
++			ByzProposer3:            vals[10],
++			IsolatedHonestProposer1: vals[11],
++			IsolatedHonestProposer2: vals[12],
++		})
++	}
++
++	return windows, nil
++}
++
++func ReorgPhaseForSlot(slot uint64) (string, ReorgWindow, bool, error) {
++	windows, err := ReadReorgWindows()
++	if err != nil {
++		return "", ReorgWindow{}, false, err
++	}
++
++	for _, w := range windows {
++		switch slot {
++		case w.PrivateSlot1:
++			return "private_slot_1", w, true, nil
++		case w.PrivateSlot2:
++			return "private_slot_2", w, true, nil
++		case w.PrivateSlot3:
++			return "private_slot_3", w, true, nil
++		case w.IsolatedHonestSlot1:
++			return "isolated_honest_slot_1", w, true, nil
++		case w.IsolatedHonestSlot2:
++			return "isolated_honest_slot_2", w, true, nil
++		case w.ReleaseSlot:
++			return "release_slot", w, true, nil
++		}
++	}
++
++	return "", ReorgWindow{}, false, nil
++}
++
++type ReorgResult struct {
++	Epoch               uint64
++	StartSlot           uint64
++	PrivateSlot1        uint64
++	PrivateSlot2        uint64
++	PrivateSlot3        uint64
++	IsolatedHonestSlot1 uint64
++	IsolatedHonestSlot2 uint64
++	ReleaseSlot         uint64
++
++	PrivateRoot1        string
++	PrivateRoot2        string
++	PrivateRoot3        string
++	IsolatedHonestRoot1 string
++	IsolatedHonestRoot2 string
++	ReleaseBlockRoot    string
++	ReleaseParentRoot   string
++	Success             string
++	Reason              string
++}
++
++func ReorgResultsFilePath() string {
++	return os.Getenv("EXPERIMENT_REORG_RESULTS_CSV")
++}
++
++func ShouldWriteReorgResults() bool {
++	return ReorgResultsFilePath() != ""
++}
++
++func AppendReorgResult(r ReorgResult) error {
++	path := ReorgResultsFilePath()
++	if path == "" {
++		return nil
++	}
++
++	needHeader := false
++	if st, err := os.Stat(path); err != nil {
++		if os.IsNotExist(err) {
++			needHeader = true
++		} else {
++			return err
++		}
++	} else if st.Size() == 0 {
++		needHeader = true
++	}
++
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
++	if err != nil {
++		return err
++	}
++	defer func() {
++		_ = f.Close()
++	}()
++
++	w := csv.NewWriter(f)
++	defer w.Flush()
++
++	if needHeader {
++		if err := w.Write([]string{
++			"epoch",
++			"start_slot",
++			"private_slot_1",
++			"private_slot_2",
++			"private_slot_3",
++			"isolated_honest_slot_1",
++			"isolated_honest_slot_2",
++			"release_slot",
++			"private_root_1",
++			"private_root_2",
++			"private_root_3",
++			"isolated_honest_root_1",
++			"isolated_honest_root_2",
++			"release_block_root",
++			"release_parent_root",
++			"success",
++			"reason",
++		}); err != nil {
++			return err
++		}
++	}
++
++	return w.Write([]string{
++		strconv.FormatUint(r.Epoch, 10),
++		strconv.FormatUint(r.StartSlot, 10),
++		strconv.FormatUint(r.PrivateSlot1, 10),
++		strconv.FormatUint(r.PrivateSlot2, 10),
++		strconv.FormatUint(r.PrivateSlot3, 10),
++		strconv.FormatUint(r.IsolatedHonestSlot1, 10),
++		strconv.FormatUint(r.IsolatedHonestSlot2, 10),
++		strconv.FormatUint(r.ReleaseSlot, 10),
++		r.PrivateRoot1,
++		r.PrivateRoot2,
++		r.PrivateRoot3,
++		r.IsolatedHonestRoot1,
++		r.IsolatedHonestRoot2,
++		r.ReleaseBlockRoot,
++		r.ReleaseParentRoot,
++		r.Success,
++		r.Reason,
++	})
++}
++
++type ReorgPrivateRoot struct {
++	Epoch     uint64
++	StartSlot uint64
++	Slot      uint64
++	Phase     string
++	BlockRoot string
++}
++
++func ReorgPrivateRootsFilePath() string {
++	return os.Getenv("EXPERIMENT_REORG_PRIVATE_ROOTS_CSV")
++}
++
++func ShouldWriteReorgPrivateRoots() bool {
++	return ReorgPrivateRootsFilePath() != ""
++}
++
++func AppendReorgPrivateRoot(r ReorgPrivateRoot) error {
++	path := ReorgPrivateRootsFilePath()
++	if path == "" {
++		return nil
++	}
++
++	needHeader := false
++	if st, err := os.Stat(path); err != nil {
++		if os.IsNotExist(err) {
++			needHeader = true
++		} else {
++			return err
++		}
++	} else if st.Size() == 0 {
++		needHeader = true
++	}
++
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
++	if err != nil {
++		return err
++	}
++	defer func() {
++		_ = f.Close()
++	}()
++
++	w := csv.NewWriter(f)
++	defer w.Flush()
++
++	if needHeader {
++		if err := w.Write([]string{
++			"epoch",
++			"start_slot",
++			"slot",
++			"phase",
++			"block_root",
++		}); err != nil {
++			return err
++		}
++	}
++
++	return w.Write([]string{
++		strconv.FormatUint(r.Epoch, 10),
++		strconv.FormatUint(r.StartSlot, 10),
++		strconv.FormatUint(r.Slot, 10),
++		r.Phase,
++		r.BlockRoot,
++	})
++}
++
++func ReadReorgPrivateRoots() ([]ReorgPrivateRoot, error) {
++	path := ReorgPrivateRootsFilePath()
++	if path == "" {
++		return nil, nil
++	}
++
++	f, err := os.Open(path)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil, nil
++		}
++		return nil, err
++	}
++	defer func() {
++		_ = f.Close()
++	}()
++
++	rows, err := csv.NewReader(f).ReadAll()
++	if err != nil {
++		return nil, err
++	}
++
++	out := make([]ReorgPrivateRoot, 0, len(rows))
++	for i, row := range rows {
++		if i == 0 {
++			continue
++		}
++		if len(row) < 5 {
++			continue
++		}
++
++		epoch, err := strconv.ParseUint(row[0], 10, 64)
++		if err != nil {
++			continue
++		}
++		startSlot, err := strconv.ParseUint(row[1], 10, 64)
++		if err != nil {
++			continue
++		}
++		slot, err := strconv.ParseUint(row[2], 10, 64)
++		if err != nil {
++			continue
++		}
++
++		out = append(out, ReorgPrivateRoot{
++			Epoch:     epoch,
++			StartSlot: startSlot,
++			Slot:      slot,
++			Phase:     row[3],
++			BlockRoot: row[4],
++		})
++	}
++
++	return out, nil
++}
++
++func ReorgPrivateVoteRootForSlot(slot uint64) (string, string, ReorgWindow, bool, error) {
++	phase, w, ok, err := ReorgPhaseForSlot(slot)
++	if err != nil || !ok {
++		return "", "", ReorgWindow{}, false, err
++	}
++
++	var voteSlot uint64
++	switch phase {
++	case "private_slot_1":
++		voteSlot = w.PrivateSlot1
++	case "private_slot_2":
++		voteSlot = w.PrivateSlot2
++	case "private_slot_3":
++		voteSlot = w.PrivateSlot3
++	case "isolated_honest_slot_1", "isolated_honest_slot_2":
++		voteSlot = w.PrivateSlot3
++	default:
++		return "", phase, w, false, nil
++	}
++
++	roots, err := ReadReorgPrivateRoots()
++	if err != nil {
++		return "", phase, w, false, err
++	}
++
++	for i := len(roots) - 1; i >= 0; i-- {
++		r := roots[i]
++		if r.StartSlot == w.StartSlot && r.Slot == voteSlot {
++			return r.BlockRoot, phase, w, true, nil
++		}
++	}
++
++	return "", phase, w, false, nil
++}
+diff --git a/validator/client/BUILD.bazel b/validator/client/BUILD.bazel
+index a3075c0c68..d2ab45b3cc 100644
+--- a/validator/client/BUILD.bazel
++++ b/validator/client/BUILD.bazel
+@@ -7,6 +7,7 @@ go_library(
+         "aggregator_selector.go",
+         "attest.go",
+         "duties.go",
++        "reorg_window.go",
+         "duty_store.go",
+         "health_monitor.go",
+         "key_reload.go",
+@@ -99,6 +100,7 @@ go_library(
+         "@org_golang_google_protobuf//proto:go_default_library",
+         "@org_golang_google_protobuf//types/known/emptypb:go_default_library",
+         "@org_golang_x_sync//singleflight:go_default_library",
++        "//runtime/experiment:go_default_library",
+     ],
+ )
+ 
+diff --git a/validator/client/attest.go b/validator/client/attest.go
+index b5a14767bb..0cc0898613 100644
+--- a/validator/client/attest.go
++++ b/validator/client/attest.go
+@@ -2,6 +2,7 @@ package client
+ 
+ import (
+ 	"context"
++	"encoding/hex"
+ 	"fmt"
+ 	"strings"
+ 	"time"
+@@ -18,6 +19,7 @@ import (
+ 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
+ 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+ 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
++	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
+ 	prysmTime "github.com/OffchainLabs/prysm/v7/time"
+ 	"github.com/OffchainLabs/prysm/v7/time/slots"
+ 	"github.com/OffchainLabs/prysm/v7/validator/client/iface"
+@@ -27,6 +29,25 @@ import (
+ 
+ var failedAttLocalProtectionErr = "attempted to make slashable attestation, rejected by local slashing protection"
+ 
++func reorgDecodeRoot(root string) ([]byte, error) {
++	b, err := hex.DecodeString(strings.TrimPrefix(root, "0x"))
++	if err != nil {
++		return nil, err
++	}
++	if len(b) != fieldparams.RootLength {
++		return nil, fmt.Errorf("invalid reorg root length %d", len(b))
++	}
++	return b, nil
++}
++
++func reorgIsPrivateVotePhase(phase string) bool {
++	return phase == "private_slot_1" ||
++		phase == "private_slot_2" ||
++		phase == "private_slot_3" ||
++		phase == "isolated_honest_slot_1" ||
++		phase == "isolated_honest_slot_2"
++}
++
+ // SubmitAttestation completes the validator client's attester responsibility at a given slot.
+ // It fetches the latest beacon block head along with the latest canonical beacon state
+ // information in order to sign the block and include information about the validator's
+@@ -70,6 +91,11 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
+ 		return
+ 	}
+ 
++	if experiment.IsReorgMode() && !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
++		log.WithField("validatorIndex", duty.ValidatorIndex).Debug("EXPERIMENT: skipping attestation for validator role")
++		return
++	}
++
+ 	postElectra := slots.ToEpoch(slot) >= params.BeaconConfig().ElectraForkEpoch
+ 
+ 	data, err := v.getAttestationData(ctx, slot, duty.CommitteeIndex)
+@@ -82,6 +108,69 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
+ 		return
+ 	}
+ 
++	reorgWithholdAttestation := false
++	reorgPrivateVoteRoot := ""
++	reorgPrivateVotePhase := ""
++	var reorgPrivateVoteWindow experiment.ReorgWindow
++
++	if experiment.IsReorgMode() && experiment.IsMaliciousValidator(uint64(duty.ValidatorIndex), 0) {
++		privateRoot, phase, window, ok, err := experiment.ReorgPrivateVoteRootForSlot(uint64(slot))
++		if err != nil {
++			log.WithError(err).WithField("validatorIndex", duty.ValidatorIndex).Warn("[REORG] Failed to read private vote root")
++			return
++		}
++
++		if reorgIsPrivateVotePhase(phase) {
++			if !ok || privateRoot == "" {
++				log.WithFields(logrus.Fields{
++					"validatorIndex": duty.ValidatorIndex,
++					"phase":          phase,
++				}).Warn("[REORG] Missing private vote root, withholding byzantine attestation instead of public vote")
++				return
++			}
++
++			privateRootBytes, err := reorgDecodeRoot(privateRoot)
++			if err != nil {
++				log.WithError(err).WithFields(logrus.Fields{
++					"validatorIndex": duty.ValidatorIndex,
++					"phase":          phase,
++					"privateRoot":    privateRoot,
++				}).Warn("[REORG] Invalid private vote root")
++				return
++			}
++
++			publicRoot := fmt.Sprintf("%#x", data.BeaconBlockRoot)
++			data.BeaconBlockRoot = privateRootBytes
++
++			reorgWithholdAttestation = true
++			reorgPrivateVoteRoot = privateRoot
++			reorgPrivateVotePhase = phase
++			reorgPrivateVoteWindow = window
++
++			log.WithFields(logrus.Fields{
++				"validatorIndex": duty.ValidatorIndex,
++				"phase":          phase,
++				"publicRoot":     publicRoot,
++				"privateRoot":    privateRoot,
++				"startSlot":      window.StartSlot,
++				"releaseSlot":    window.ReleaseSlot,
++			}).Warn("[REORG] Byzantine attester voting for private root and withholding attestation")
++		}
++	}
++
++	experiment.WriteReorgEvent(
++		"attestation_data",
++		"attestation",
++		uint64(slot),
++		uint64(duty.ValidatorIndex),
++		experiment.IsMaliciousValidator(uint64(duty.ValidatorIndex), 0),
++		fmt.Sprintf("%#x", data.BeaconBlockRoot),
++		"",
++		fmt.Sprintf("%#x", data.BeaconBlockRoot),
++		"",
++		0,
++	)
++
+ 	sig, _, err := v.signAtt(ctx, pubKey, data, slot)
+ 	if err != nil {
+ 		log.WithError(err).Error("Could not sign attestation")
+@@ -138,7 +227,9 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
+ 			Signature:     sig,
+ 		}
+ 		attestation = sa
+-		attResp, err = v.validatorClient.ProposeAttestationElectra(ctx, sa)
++		if !reorgWithholdAttestation {
++			attResp, err = v.validatorClient.ProposeAttestationElectra(ctx, sa)
++		}
+ 	} else {
+ 		aggregationBitfield = bitfield.NewBitlist(duty.CommitteeLength)
+ 		aggregationBitfield.SetBitAt(duty.ValidatorCommitteeIndex, true)
+@@ -148,8 +239,87 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
+ 			Signature:       sig,
+ 		}
+ 		attestation = a
+-		attResp, err = v.validatorClient.ProposeAttestation(ctx, a)
++		if !reorgWithholdAttestation {
++			attResp, err = v.validatorClient.ProposeAttestation(ctx, a)
++		}
++	}
++	if reorgWithholdAttestation {
++		releaseAt, err := slots.StartTime(v.genesisTime, primitives.Slot(reorgPrivateVoteWindow.IsolatedHonestSlot2))
++		if err != nil {
++			log.WithError(err).WithFields(logrus.Fields{
++				"validatorIndex": duty.ValidatorIndex,
++				"phase":          reorgPrivateVotePhase,
++				"startSlot":      reorgPrivateVoteWindow.StartSlot,
++			}).Warn("[REORG] Failed to compute attestation release time")
++			return
++		}
++		releaseAt = releaseAt.Add(9*time.Second + 300*time.Millisecond)
++		delay := max(time.Until(releaseAt), 0)
++
++		log.WithFields(logrus.Fields{
++			"validatorIndex": duty.ValidatorIndex,
++			"phase":          reorgPrivateVotePhase,
++			"privateRoot":    reorgPrivateVoteRoot,
++			"delay":          delay.String(),
++			"startSlot":      reorgPrivateVoteWindow.StartSlot,
++			"releaseSlot":    reorgPrivateVoteWindow.ReleaseSlot,
++		}).Warn("[REORG] Scheduled withheld Byzantine attestation release at chain release time")
++
++		go func() {
++			timer := time.NewTimer(delay)
++			defer timer.Stop()
++			<-timer.C
++
++			submitCtx := context.Background()
++			var submitErr error
++
++			if postElectra {
++				sa, ok := attestation.(*ethpb.SingleAttestation)
++				if !ok {
++					log.WithField("validatorIndex", duty.ValidatorIndex).Warn("[REORG] Withheld attestation type mismatch for Electra")
++					return
++				}
++				_, submitErr = v.validatorClient.ProposeAttestationElectra(submitCtx, sa)
++			} else {
++				a, ok := attestation.(*ethpb.Attestation)
++				if !ok {
++					log.WithField("validatorIndex", duty.ValidatorIndex).Warn("[REORG] Withheld attestation type mismatch")
++					return
++				}
++				_, submitErr = v.validatorClient.ProposeAttestation(submitCtx, a)
++			}
++
++			if submitErr != nil {
++				log.WithError(submitErr).WithFields(logrus.Fields{
++					"validatorIndex": duty.ValidatorIndex,
++					"phase":          reorgPrivateVotePhase,
++					"privateRoot":    reorgPrivateVoteRoot,
++				}).Warn("[REORG] Failed to release withheld Byzantine attestation")
++				return
++			}
++
++			if err := v.saveSubmittedAtt(attestation, pubKey[:], false); err != nil {
++				log.WithError(err).WithField("validatorIndex", duty.ValidatorIndex).Warn("[REORG] Could not save released Byzantine attestation")
++				return
++			}
++
++			if v.emitAccountMetrics {
++				ValidatorAttestSuccessVec.WithLabelValues(fmtKey).Inc()
++				ValidatorAttestedSlotsGaugeVec.WithLabelValues(fmtKey).Set(float64(slot))
++			}
++
++			log.WithFields(logrus.Fields{
++				"validatorIndex": duty.ValidatorIndex,
++				"phase":          reorgPrivateVotePhase,
++				"privateRoot":    reorgPrivateVoteRoot,
++				"startSlot":      reorgPrivateVoteWindow.StartSlot,
++				"releaseSlot":    reorgPrivateVoteWindow.ReleaseSlot,
++			}).Warn("[REORG] Released withheld Byzantine attestation")
++		}()
++
++		return
+ 	}
++
+ 	if err != nil {
+ 		log.WithError(err).Error("Could not submit attestation to beacon node")
+ 		if v.emitAccountMetrics {
+diff --git a/validator/client/duties.go b/validator/client/duties.go
+index 7d5347f57e..44ef3d45f8 100644
+--- a/validator/client/duties.go
++++ b/validator/client/duties.go
+@@ -74,6 +74,7 @@ func (v *validator) UpdateDuties(ctx context.Context) error {
+ 	}
+ 	v.dutiesLock.Lock()
+ 	v.duties.SetFromCombinedDutiesResponse(resp)
++	v.detectNaturalReorgWindows(ss)
+ 	v.logDuties(ss)
+ 	v.dutiesLock.Unlock()
+ 
+diff --git a/validator/client/duty_store.go b/validator/client/duty_store.go
+index 5b9038f883..62319ad1c9 100644
+--- a/validator/client/duty_store.go
++++ b/validator/client/duty_store.go
+@@ -81,6 +81,20 @@ func (ds *dutyStore) ProposerSlots(idx primitives.ValidatorIndex) []primitives.S
+ 	return ds.proposerSlots[idx]
+ }
+ 
++// ProposerSchedule returns a reverse proposer duty map: slot -> proposer validator index.
++func (ds *dutyStore) ProposerSchedule() map[primitives.Slot]primitives.ValidatorIndex {
++	if !ds.IsInitialized() {
++		return nil
++	}
++	schedule := make(map[primitives.Slot]primitives.ValidatorIndex)
++	for idx, proposerSlots := range ds.proposerSlots {
++		for _, slot := range proposerSlots {
++			schedule[slot] = idx
++		}
++	}
++	return schedule
++}
++
+ // PtcSlots returns the PTC slots for a given validator index.
+ func (ds *dutyStore) PtcSlots(idx primitives.ValidatorIndex) []primitives.Slot {
+ 	if !ds.IsInitialized() {
+diff --git a/validator/client/propose.go b/validator/client/propose.go
+index 23713fd968..2ea7d71f20 100644
+--- a/validator/client/propose.go
++++ b/validator/client/propose.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
+ 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+ 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
++	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
+ 	"github.com/OffchainLabs/prysm/v7/runtime/version"
+ 	"github.com/OffchainLabs/prysm/v7/time/slots"
+ 	"github.com/OffchainLabs/prysm/v7/validator/client/iface"
+@@ -58,6 +59,19 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
+ 	span.SetAttributes(trace.StringAttribute("validator", fmtKey))
+ 	log := log.WithField("pubkey", fmt.Sprintf("%#x", bytesutil.Trunc(pubKey[:])))
+ 
++	duty, err := v.duty(pubKey)
++	if err != nil {
++		log.WithError(err).Error("Could not fetch validator assignment")
++		if v.emitAccountMetrics {
++			ValidatorProposeFailVec.WithLabelValues(fmtKey).Inc()
++		}
++		return
++	}
++	if experiment.IsReorgMode() && !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
++		log.WithField("validatorIndex", duty.ValidatorIndex).Debug("EXPERIMENT: skipping proposal for validator role")
++		return
++	}
++
+ 	// Sign randao reveal, it's used to request block from beacon node
+ 	epoch := primitives.Epoch(slot / params.BeaconConfig().SlotsPerEpoch)
+ 	randaoReveal, err := v.signRandaoReveal(ctx, pubKey, epoch, slot)
+@@ -177,6 +191,19 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
+ 		return
+ 	}
+ 
++	experiment.WriteReorgEvent(
++		"block_proposed",
++		"proposal",
++		uint64(slot),
++		uint64(duty.ValidatorIndex),
++		experiment.IsMaliciousValidator(uint64(duty.ValidatorIndex), 0),
++		fmt.Sprintf("%#x", blkResp.BlockRoot),
++		fmt.Sprintf("%#x", blk.Block().ParentRoot()),
++		"",
++		"",
++		0,
++	)
++
+ 	if err := v.proposeSelfBuildEnvelope(ctx, slot, pubKey, blk); err != nil {
+ 		log.WithError(err).Error("Failed to propose self-build envelope")
+ 		return
+diff --git a/validator/client/reorg_window.go b/validator/client/reorg_window.go
+new file mode 100644
+index 0000000000..51315970b2
+--- /dev/null
++++ b/validator/client/reorg_window.go
+@@ -0,0 +1,193 @@
++package client
++
++import (
++	"sync"
++
++	"github.com/OffchainLabs/prysm/v7/config/params"
++	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
++	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
++	"github.com/OffchainLabs/prysm/v7/time/slots"
++	"github.com/sirupsen/logrus"
++)
++
++type reorgWindow struct {
++	Epoch primitives.Epoch
++
++	StartSlot           primitives.Slot
++	PrivateSlot1        primitives.Slot
++	PrivateSlot2        primitives.Slot
++	PrivateSlot3        primitives.Slot
++	IsolatedHonestSlot1 primitives.Slot
++	IsolatedHonestSlot2 primitives.Slot
++	ReleaseSlot         primitives.Slot
++
++	ByzProposer1            primitives.ValidatorIndex
++	ByzProposer2            primitives.ValidatorIndex
++	ByzProposer3            primitives.ValidatorIndex
++	IsolatedHonestProposer1 primitives.ValidatorIndex
++	IsolatedHonestProposer2 primitives.ValidatorIndex
++}
++
++var reorgWindows = struct {
++	sync.RWMutex
++	bySlot  map[primitives.Slot]reorgWindow
++	byStart map[primitives.Slot]reorgWindow
++}{
++	bySlot:  make(map[primitives.Slot]reorgWindow),
++	byStart: make(map[primitives.Slot]reorgWindow),
++}
++
++func reorgWindowForSlot(slot primitives.Slot) (reorgWindow, bool) {
++	reorgWindows.RLock()
++	defer reorgWindows.RUnlock()
++
++	w, ok := reorgWindows.bySlot[slot]
++	return w, ok
++}
++
++func reorgPhaseForSlot(slot primitives.Slot) string {
++	w, ok := reorgWindowForSlot(slot)
++	if !ok {
++		return ""
++	}
++
++	switch slot {
++	case w.PrivateSlot1:
++		return "private_slot_1"
++	case w.PrivateSlot2:
++		return "private_slot_2"
++	case w.PrivateSlot3:
++		return "private_slot_3"
++	case w.IsolatedHonestSlot1:
++		return "isolated_honest_slot_1"
++	case w.IsolatedHonestSlot2:
++		return "isolated_honest_slot_2"
++	case w.ReleaseSlot:
++		return "release_slot"
++	default:
++		return "inside_window"
++	}
++}
++
++func recordReorgWindow(w reorgWindow) bool {
++	reorgWindows.Lock()
++	defer reorgWindows.Unlock()
++
++	if _, exists := reorgWindows.byStart[w.StartSlot]; exists {
++		return false
++	}
++
++	for slot := w.StartSlot; slot <= w.ReleaseSlot; slot++ {
++		if _, overlaps := reorgWindows.bySlot[slot]; overlaps {
++			return false
++		}
++	}
++
++	reorgWindows.byStart[w.StartSlot] = w
++	for slot := w.StartSlot; slot <= w.ReleaseSlot; slot++ {
++		reorgWindows.bySlot[slot] = w
++	}
++
++	return true
++}
++
++func reorgWindowLogFields(w reorgWindow) logrus.Fields {
++	return logrus.Fields{
++		"epoch":                   w.Epoch,
++		"startSlot":               w.StartSlot,
++		"privateSlot1":            w.PrivateSlot1,
++		"privateSlot2":            w.PrivateSlot2,
++		"privateSlot3":            w.PrivateSlot3,
++		"isolatedHonestSlot1":     w.IsolatedHonestSlot1,
++		"isolatedHonestSlot2":     w.IsolatedHonestSlot2,
++		"releaseSlot":             w.ReleaseSlot,
++		"byzProposer1":            w.ByzProposer1,
++		"byzProposer2":            w.ByzProposer2,
++		"byzProposer3":            w.ByzProposer3,
++		"isolatedHonestProposer1": w.IsolatedHonestProposer1,
++		"isolatedHonestProposer2": w.IsolatedHonestProposer2,
++	}
++}
++
++// detectNaturalReorgWindows scans the cached proposer duty schedule and records
++// every non-overlapping natural B,B,B,H,H pattern:
++//
++//	slot s     : Byzantine proposer
++//	slot s+1   : Byzantine proposer
++//	slot s+2   : Byzantine proposer
++//	slot s+3   : Honest proposer to be isolated
++//	slot s+4   : Honest proposer to be isolated
++//	slot s+5   : release slot
++func (v *validator) detectNaturalReorgWindows(epochStartSlot primitives.Slot) {
++	schedule := v.duties.ProposerSchedule()
++	if len(schedule) == 0 {
++		return
++	}
++
++	slotsPerEpoch := params.BeaconConfig().SlotsPerEpoch
++	epoch := slots.ToEpoch(epochStartSlot)
++
++	for offset := primitives.Slot(0); offset+5 < slotsPerEpoch; offset++ {
++		s := epochStartSlot + offset
++
++		p0, ok0 := schedule[s]
++		p1, ok1 := schedule[s+1]
++		p2, ok2 := schedule[s+2]
++		p3, ok3 := schedule[s+3]
++		p4, ok4 := schedule[s+4]
++		if !ok0 || !ok1 || !ok2 || !ok3 || !ok4 {
++			continue
++		}
++
++		b0 := experiment.IsMaliciousValidator(uint64(p0), 0)
++		b1 := experiment.IsMaliciousValidator(uint64(p1), 0)
++		b2 := experiment.IsMaliciousValidator(uint64(p2), 0)
++		b3 := experiment.IsMaliciousValidator(uint64(p3), 0)
++		b4 := experiment.IsMaliciousValidator(uint64(p4), 0)
++
++		if !b0 || !b1 || !b2 || b3 || b4 {
++			continue
++		}
++
++		w := reorgWindow{
++			Epoch:                   epoch,
++			StartSlot:               s,
++			PrivateSlot1:            s,
++			PrivateSlot2:            s + 1,
++			PrivateSlot3:            s + 2,
++			IsolatedHonestSlot1:     s + 3,
++			IsolatedHonestSlot2:     s + 4,
++			ReleaseSlot:             s + 5,
++			ByzProposer1:            p0,
++			ByzProposer2:            p1,
++			ByzProposer3:            p2,
++			IsolatedHonestProposer1: p3,
++			IsolatedHonestProposer2: p4,
++		}
++
++		if recordReorgWindow(w) {
++			if experiment.ShouldWriteReorgWindows() {
++				if err := experiment.AppendReorgWindow(experiment.ReorgWindow{
++					Epoch:                   uint64(w.Epoch),
++					StartSlot:               uint64(w.StartSlot),
++					PrivateSlot1:            uint64(w.PrivateSlot1),
++					PrivateSlot2:            uint64(w.PrivateSlot2),
++					PrivateSlot3:            uint64(w.PrivateSlot3),
++					IsolatedHonestSlot1:     uint64(w.IsolatedHonestSlot1),
++					IsolatedHonestSlot2:     uint64(w.IsolatedHonestSlot2),
++					ReleaseSlot:             uint64(w.ReleaseSlot),
++					ByzProposer1:            uint64(w.ByzProposer1),
++					ByzProposer2:            uint64(w.ByzProposer2),
++					ByzProposer3:            uint64(w.ByzProposer3),
++					IsolatedHonestProposer1: uint64(w.IsolatedHonestProposer1),
++					IsolatedHonestProposer2: uint64(w.IsolatedHonestProposer2),
++				}); err != nil {
++					log.WithError(err).WithFields(reorgWindowLogFields(w)).Warn("[REORG] Failed to write B,B,B,H,H attack window")
++				}
++			}
++			log.WithFields(reorgWindowLogFields(w)).Warn("[REORG] Natural B,B,B,H,H attack window scheduled")
++		} else {
++			log.WithFields(reorgWindowLogFields(w)).Warn("[REORG] Natural B,B,B,H,H attack window skipped due to overlap")
++		}
++	}
++}
+diff --git a/validator/client/sync_committee.go b/validator/client/sync_committee.go
+index 30124c3d88..b2180037f2 100644
+--- a/validator/client/sync_committee.go
++++ b/validator/client/sync_committee.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
+ 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+ 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
++	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
+ 	"github.com/OffchainLabs/prysm/v7/time/slots"
+ 	"github.com/ethereum/go-ethereum/common/hexutil"
+ 	emptypb "github.com/golang/protobuf/ptypes/empty"
+@@ -41,6 +42,10 @@ func (v *validator) SubmitSyncCommitteeMessage(ctx context.Context, slot primiti
+ 		log.WithError(err).Error("Could not fetch validator assignment")
+ 		return
+ 	}
++	if experiment.IsReorgMode() && !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
++		log.WithField("validatorIndex", duty.ValidatorIndex).Debug("EXPERIMENT: skipping sync committee message for validator role")
++		return
++	}
+ 
+ 	d, err := v.domainData(ctx, slots.ToEpoch(slot), params.BeaconConfig().DomainSyncCommittee[:])
+ 	if err != nil {
+@@ -105,6 +110,10 @@ func (v *validator) SubmitSignedContributionAndProof(ctx context.Context, slot p
+ 		log.WithError(err).Error("Could not fetch validator assignment")
+ 		return
+ 	}
++	if experiment.IsReorgMode() && !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
++		log.WithField("validatorIndex", duty.ValidatorIndex).Debug("EXPERIMENT: skipping sync committee contribution for validator role")
++		return
++	}
+ 
+ 	indexRes, err := v.validatorClient.SyncSubcommitteeIndex(ctx, &ethpb.SyncSubcommitteeIndexRequest{
+ 		PublicKey: pubKey[:],

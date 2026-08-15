@@ -1,0 +1,343 @@
+diff --git a/beacon-chain/core/altair/BUILD.bazel b/beacon-chain/core/altair/BUILD.bazel
+index 1b64b193ee..3dae3f2e8f 100644
+--- a/beacon-chain/core/altair/BUILD.bazel
++++ b/beacon-chain/core/altair/BUILD.bazel
+@@ -3,6 +3,7 @@ load("@prysm//tools/go:def.bzl", "go_library", "go_test")
+ go_library(
+     name = "go_default_library",
+     srcs = [
++        "experiment_partial_head_reward.go",
+         "attestation.go",
+         "block.go",
+         "deposit.go",
+diff --git a/beacon-chain/core/altair/attestation.go b/beacon-chain/core/altair/attestation.go
+index ae200ff7dd..9cdfda814e 100644
+--- a/beacon-chain/core/altair/attestation.go
++++ b/beacon-chain/core/altair/attestation.go
+@@ -69,7 +69,7 @@ func ProcessAttestationNoVerifySignature(
+ 	if err != nil {
+ 		return nil, fmt.Errorf("att slot %d can't be greater than state slot %d", att.GetData().Slot, beaconState.Slot())
+ 	}
+-	participatedFlags, err := AttestationParticipationFlagIndices(beaconState, att.GetData(), delay)
++	participatedFlags, partialHeadWeightBps, err := AttestationParticipationFlagIndices(beaconState, att.GetData(), delay)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -86,7 +86,7 @@ func ProcessAttestationNoVerifySignature(
+ 		return nil, errors.Wrap(err, "failed to update pending payment weight")
+ 	}
+ 
+-	return SetParticipationAndRewardProposer(ctx, beaconState, att.GetData().Target.Epoch, indices, participatedFlags, totalBalance, att)
++	return SetParticipationAndRewardProposer(ctx, beaconState, att.GetData().Target.Epoch, indices, participatedFlags, partialHeadWeightBps, totalBalance, att)
+ }
+ 
+ // SetParticipationAndRewardProposer retrieves and sets the epoch participation bits in state. Based on the epoch participation, it rewards
+@@ -117,6 +117,7 @@ func SetParticipationAndRewardProposer(
+ 	targetEpoch primitives.Epoch,
+ 	indices []uint64,
+ 	participatedFlags map[uint8]bool,
++	partialHeadWeightBps uint64,
+ 	totalBalance uint64,
+ 	att ethpb.Att) (state.BeaconState, error) {
+ 	var proposerRewardNumerator uint64
+@@ -124,7 +125,7 @@ func SetParticipationAndRewardProposer(
+ 	var stateErr error
+ 	if targetEpoch == currentEpoch {
+ 		stateErr = beaconState.ModifyCurrentParticipationBits(func(val []byte) ([]byte, error) {
+-			propRewardNum, epochParticipation, err := EpochParticipation(beaconState, indices, val, participatedFlags, totalBalance)
++			propRewardNum, epochParticipation, err := EpochParticipation(beaconState, indices, val, participatedFlags, partialHeadWeightBps, targetEpoch, totalBalance)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -133,7 +134,7 @@ func SetParticipationAndRewardProposer(
+ 		})
+ 	} else {
+ 		stateErr = beaconState.ModifyPreviousParticipationBits(func(val []byte) ([]byte, error) {
+-			propRewardNum, epochParticipation, err := EpochParticipation(beaconState, indices, val, participatedFlags, totalBalance)
++			propRewardNum, epochParticipation, err := EpochParticipation(beaconState, indices, val, participatedFlags, partialHeadWeightBps, targetEpoch, totalBalance)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -178,7 +179,7 @@ func AddValidatorFlag(flag, flagPosition uint8) (uint8, error) {
+ //	        if flag_index in participation_flag_indices and not has_flag(epoch_participation[index], flag_index):
+ //	            epoch_participation[index] = add_flag(epoch_participation[index], flag_index)
+ //	            proposer_reward_numerator += get_base_reward(state, index) * weight
+-func EpochParticipation(beaconState state.ReadOnlyBeaconState, indices []uint64, epochParticipation []byte, participatedFlags map[uint8]bool, totalBalance uint64) (uint64, []byte, error) {
++func EpochParticipation(beaconState state.ReadOnlyBeaconState, indices []uint64, epochParticipation []byte, participatedFlags map[uint8]bool, partialHeadWeightBps uint64, targetEpoch primitives.Epoch, totalBalance uint64) (uint64, []byte, error) {
+ 	cfg := params.BeaconConfig()
+ 	sourceFlagIndex := cfg.TimelySourceFlagIndex
+ 	targetFlagIndex := cfg.TimelyTargetFlagIndex
+@@ -188,10 +189,12 @@ func EpochParticipation(beaconState state.ReadOnlyBeaconState, indices []uint64,
+ 		if index >= uint64(len(epochParticipation)) {
+ 			return 0, nil, fmt.Errorf("index %d exceeds participation length %d", index, len(epochParticipation))
+ 		}
+-		br, err := BaseRewardWithTotalBalance(beaconState, primitives.ValidatorIndex(index), totalBalance)
++		validatorIndex := primitives.ValidatorIndex(index)
++		br, err := BaseRewardWithTotalBalance(beaconState, validatorIndex, totalBalance)
+ 		if err != nil {
+ 			return 0, nil, err
+ 		}
++		experimentRecordPartialHeadReward(targetEpoch, validatorIndex, partialHeadWeightBps)
+ 		has, err := HasValidatorFlag(epochParticipation[index], sourceFlagIndex)
+ 		if err != nil {
+ 			return 0, nil, err
+@@ -280,7 +283,7 @@ func RewardProposer(ctx context.Context, beaconState state.BeaconState, proposer
+ //	    participation_flag_indices.append(TIMELY_HEAD_FLAG_INDEX)
+ //
+ //	return participation_flag_indices
+-func AttestationParticipationFlagIndices(beaconState state.ReadOnlyBeaconState, data *ethpb.AttestationData, delay primitives.Slot) (map[uint8]bool, error) {
++func AttestationParticipationFlagIndices(beaconState state.ReadOnlyBeaconState, data *ethpb.AttestationData, delay primitives.Slot) (map[uint8]bool, uint64, error) {
+ 	currEpoch := time.CurrentEpoch(beaconState)
+ 	var justifiedCheckpt *ethpb.Checkpoint
+ 	if data.Target.Epoch == currEpoch {
+@@ -291,13 +294,15 @@ func AttestationParticipationFlagIndices(beaconState state.ReadOnlyBeaconState,
+ 
+ 	matchedSrc, matchedTgt, matchedHead, err := MatchingStatus(beaconState, data, justifiedCheckpt)
+ 	if err != nil {
+-		return nil, err
++		return nil, 0, err
+ 	}
+ 	if !matchedSrc {
+-		return nil, errors.New("source epoch does not match")
++		return nil, 0, errors.New("source epoch does not match")
+ 	}
+ 
+ 	participatedFlags := make(map[uint8]bool)
++	partialHeadWeightBps := uint64(0)
++
+ 	cfg := params.BeaconConfig()
+ 	sourceFlagIndex := cfg.TimelySourceFlagIndex
+ 	targetFlagIndex := cfg.TimelyTargetFlagIndex
+@@ -322,13 +327,25 @@ func AttestationParticipationFlagIndices(beaconState state.ReadOnlyBeaconState,
+ 		uint64(data.CommitteeIndex),
+ 	)
+ 	if err != nil {
+-		return nil, err
++		return nil, 0, err
+ 	}
++
+ 	matchedSrcTgtHead = matchedSrcTgtHead && matchingPayload
+ 	if matchedSrcTgtHead && delay == cfg.MinAttestationInclusionDelay {
+ 		participatedFlags[headFlagIndex] = true
+ 	}
+-	return participatedFlags, nil
++
++	if experimentPartialHeadRewardEnabled() && matchedSrcTgt && delay == cfg.MinAttestationInclusionDelay {
++		weightBps, ok, err := experimentPartialHeadWeightBpsForData(beaconState, data)
++		if err != nil {
++			return nil, 0, err
++		}
++		if ok {
++			partialHeadWeightBps = weightBps
++		}
++	}
++
++	return participatedFlags, partialHeadWeightBps, nil
+ }
+ 
+ // MatchingStatus returns the matching statues for attestation data's source target and head.
+diff --git a/beacon-chain/core/altair/epoch_precompute.go b/beacon-chain/core/altair/epoch_precompute.go
+index 5edba5ee69..42a7e3ff22 100644
+--- a/beacon-chain/core/altair/epoch_precompute.go
++++ b/beacon-chain/core/altair/epoch_precompute.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/time"
+ 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
+ 	"github.com/OffchainLabs/prysm/v7/config/params"
++	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+ 	"github.com/OffchainLabs/prysm/v7/math"
+ 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
+ 	"github.com/pkg/errors"
+@@ -224,6 +225,20 @@ func ProcessEpochParticipation(
+ 			vals[i].IsPrevEpochHeadAttester = true
+ 		}
+ 	}
++	if experimentPartialHeadRewardEnabled() {
++		prevEpoch := time.PrevEpoch(beaconState)
++		for i := range vals {
++			if !vals[i].IsActivePrevEpoch {
++				continue
++			}
++			if weightBps, ok := experimentLookupPartialHeadReward(prevEpoch, primitives.ValidatorIndex(i)); ok && weightBps > 0 {
++				vals[i].IsPrevEpochHeadAttester = true
++				vals[i].ExperimentPrevEpochHeadWeightBps = weightBps
++			} else if vals[i].IsPrevEpochHeadAttester {
++				vals[i].ExperimentPrevEpochHeadWeightBps = experimentHeadWeightBpsForDistance(0)
++			}
++		}
++	}
+ 	bal = precompute.UpdateBalance(vals, bal, beaconState.Version())
+ 	return vals, bal, nil
+ }
+@@ -356,7 +371,15 @@ func attestationDelta(
+ 	if val.IsPrevEpochHeadAttester && !val.IsSlashed {
+ 		if !inactivityLeak {
+ 			n := baseReward * headWeight * (bal.PrevEpochHeadAttested / increment)
+-			attDelta.HeadReward += n / (activeIncrement * weightDenominator)
++			headReward := n / (activeIncrement * weightDenominator)
++			if experimentPartialHeadRewardEnabled() {
++				weightBps := val.ExperimentPrevEpochHeadWeightBps
++				if weightBps == 0 {
++					weightBps = experimentHeadWeightBpsForDistance(0)
++				}
++				headReward = headReward * weightBps / experimentPartialHeadRewardDenominatorBps
++			}
++			attDelta.HeadReward += headReward
+ 		}
+ 	}
+ 
+diff --git a/beacon-chain/core/altair/experiment_partial_head_reward.go b/beacon-chain/core/altair/experiment_partial_head_reward.go
+new file mode 100644
+index 0000000000..c73d477b55
+--- /dev/null
++++ b/beacon-chain/core/altair/experiment_partial_head_reward.go
+@@ -0,0 +1,109 @@
++package altair
++
++import (
++	"bytes"
++	"os"
++	"sync"
++
++	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/helpers"
++	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
++	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
++	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
++)
++
++const experimentPartialHeadRewardDenominatorBps uint64 = 10000
++
++type experimentPartialHeadRewardKey struct {
++	epoch primitives.Epoch
++	index primitives.ValidatorIndex
++}
++
++var (
++	experimentPartialHeadRewardMu      sync.Mutex
++	experimentPartialHeadRewardWeights = make(map[experimentPartialHeadRewardKey]uint64)
++)
++
++func experimentPartialHeadRewardEnabled() bool {
++	return os.Getenv("EXPERIMENT_PARTIAL_HEAD_REWARD") == "1"
++}
++
++func experimentHeadWeightBpsForDistance(distance uint64) uint64 {
++	switch distance {
++	case 0:
++		return 10000
++	case 1:
++		return 7200
++	case 2:
++		return 5100
++	case 3:
++		return 1400
++	default:
++		return 0
++	}
++}
++
++func experimentPartialHeadWeightBpsForData(
++	beaconState state.ReadOnlyBeaconState,
++	data *ethpb.AttestationData,
++) (uint64, bool, error) {
++	if data == nil {
++		return 0, false, nil
++	}
++
++	for distance := uint64(0); distance <= 3; distance++ {
++		if data.Slot < primitives.Slot(distance) {
++			continue
++		}
++		root, err := helpers.BlockRootAtSlot(beaconState, data.Slot-primitives.Slot(distance))
++		if err != nil {
++			return 0, false, err
++		}
++		if bytes.Equal(data.BeaconBlockRoot, root) {
++			return experimentHeadWeightBpsForDistance(distance), true, nil
++		}
++	}
++
++	return 0, false, nil
++}
++
++func experimentRecordPartialHeadReward(
++	epoch primitives.Epoch,
++	index primitives.ValidatorIndex,
++	weightBps uint64,
++) {
++	if !experimentPartialHeadRewardEnabled() || weightBps == 0 {
++		return
++	}
++
++	k := experimentPartialHeadRewardKey{
++		epoch: epoch,
++		index: index,
++	}
++
++	experimentPartialHeadRewardMu.Lock()
++	defer experimentPartialHeadRewardMu.Unlock()
++
++	if prev, ok := experimentPartialHeadRewardWeights[k]; !ok || weightBps > prev {
++		experimentPartialHeadRewardWeights[k] = weightBps
++	}
++}
++
++func experimentLookupPartialHeadReward(
++	epoch primitives.Epoch,
++	index primitives.ValidatorIndex,
++) (uint64, bool) {
++	if !experimentPartialHeadRewardEnabled() {
++		return 0, false
++	}
++
++	k := experimentPartialHeadRewardKey{
++		epoch: epoch,
++		index: index,
++	}
++
++	experimentPartialHeadRewardMu.Lock()
++	defer experimentPartialHeadRewardMu.Unlock()
++
++	weightBps, ok := experimentPartialHeadRewardWeights[k]
++	return weightBps, ok
++}
+diff --git a/beacon-chain/core/altair/upgrade.go b/beacon-chain/core/altair/upgrade.go
+index 39f64b099d..ec0777c32f 100644
+--- a/beacon-chain/core/altair/upgrade.go
++++ b/beacon-chain/core/altair/upgrade.go
+@@ -154,7 +154,7 @@ func TranslateParticipation(ctx context.Context, state state.BeaconState, atts [
+ 	}
+ 
+ 	for _, att := range atts {
+-		participatedFlags, err := AttestationParticipationFlagIndices(state, att.Data, att.InclusionDelay)
++		participatedFlags, _, err := AttestationParticipationFlagIndices(state, att.Data, att.InclusionDelay)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/beacon-chain/core/electra/attestation.go b/beacon-chain/core/electra/attestation.go
+index d09baf7af3..afc9ce19c9 100644
+--- a/beacon-chain/core/electra/attestation.go
++++ b/beacon-chain/core/electra/attestation.go
+@@ -33,7 +33,7 @@ func GetProposerRewardNumerator(
+ 		return 0, fmt.Errorf("attestation slot %d exceeds state slot %d", data.Slot, st.Slot())
+ 	}
+ 
+-	flags, err := altair.AttestationParticipationFlagIndices(st, data, delay)
++	flags, _, err := altair.AttestationParticipationFlagIndices(st, data, delay)
+ 	if err != nil {
+ 		return 0, err
+ 	}
+diff --git a/beacon-chain/core/epoch/precompute/type.go b/beacon-chain/core/epoch/precompute/type.go
+index 9ccdf0742a..5c04fbe724 100644
+--- a/beacon-chain/core/epoch/precompute/type.go
++++ b/beacon-chain/core/epoch/precompute/type.go
+@@ -26,6 +26,9 @@ type Validator struct {
+ 	IsPrevEpochTargetAttester bool
+ 	// IsPrevEpochHeadAttester is true if the validator attested the previous epoch head.
+ 	IsPrevEpochHeadAttester bool
++	// ExperimentPrevEpochHeadWeightBps stores the experimental partial-head reward weight in basis points.
++	// 10000 means full head reward; 7200/5100/1400 represent stale head distances 1/2/3.
++	ExperimentPrevEpochHeadWeightBps uint64
+ 
+ 	// CurrentEpochEffectiveBalance is how much effective balance this validator has current epoch.
+ 	CurrentEpochEffectiveBalance uint64

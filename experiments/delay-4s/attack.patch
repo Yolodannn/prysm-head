@@ -1,0 +1,985 @@
+diff --git a/beacon-chain/core/altair/BUILD.bazel b/beacon-chain/core/altair/BUILD.bazel
+index 9782a0373c..1b64b193ee 100644
+--- a/beacon-chain/core/altair/BUILD.bazel
++++ b/beacon-chain/core/altair/BUILD.bazel
+@@ -8,6 +8,7 @@ go_library(
+         "deposit.go",
+         "epoch_precompute.go",
+         "epoch_spec.go",
++        "experiment_reward_logging.go",
+         "log.go",
+         "reward.go",
+         "sync_committee.go",
+@@ -39,6 +40,8 @@ go_library(
+         "//monitoring/tracing/trace:go_default_library",
+         "//proto/prysm/v1alpha1:go_default_library",
+         "//proto/prysm/v1alpha1/attestation:go_default_library",
++        "//runtime/experiment:go_default_library",
++        "//io/file:go_default_library",
+         "//runtime/version:go_default_library",
+         "//time/slots:go_default_library",
+         "@com_github_pkg_errors//:go_default_library",
+diff --git a/beacon-chain/core/altair/epoch_precompute.go b/beacon-chain/core/altair/epoch_precompute.go
+index c266d458d9..5edba5ee69 100644
+--- a/beacon-chain/core/altair/epoch_precompute.go
++++ b/beacon-chain/core/altair/epoch_precompute.go
+@@ -3,6 +3,7 @@ package altair
+ import (
+ 	"context"
+ 	"fmt"
++	"sync"
+ 
+ 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/epoch/precompute"
+ 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/helpers"
+@@ -24,6 +25,21 @@ type AttDelta struct {
+ 	InactivityPenalty uint64
+ }
+ 
++var experimentRewardCSVWriteMu sync.Mutex
++var experimentRewardCSVWrittenEpochs = make(map[uint64]struct{})
++
++func shouldWriteExperimentRewardCSV(epoch uint64) bool {
++	experimentRewardCSVWriteMu.Lock()
++	defer experimentRewardCSVWriteMu.Unlock()
++
++	if _, ok := experimentRewardCSVWrittenEpochs[epoch]; ok {
++		return false
++	}
++
++	experimentRewardCSVWrittenEpochs[epoch] = struct{}{}
++	return true
++}
++
+ // InitializePrecomputeValidators precomputes individual validator for its attested balances and the total sum of validators attested balances of the epoch.
+ func InitializePrecomputeValidators(ctx context.Context, beaconState state.BeaconState) ([]*precompute.Validator, *precompute.Balance, error) {
+ 	_, span := trace.StartSpan(ctx, "altair.InitializePrecomputeValidators")
+@@ -235,6 +251,10 @@ func ProcessRewardsAndPenaltiesPrecompute(
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "could not get attestation delta")
+ 	}
++	rewardEpoch := uint64(time.PrevEpoch(beaconState))
++	if shouldWriteExperimentRewardCSV(rewardEpoch) {
++		writeExperimentRewardCSV(beaconState, vals, attDeltas)
++	}
+ 
+ 	balances := beaconState.Balances()
+ 	for i := range numOfVals {
+diff --git a/beacon-chain/core/altair/experiment_reward_logging.go b/beacon-chain/core/altair/experiment_reward_logging.go
+new file mode 100644
+index 0000000000..2d4a5b3b0c
+--- /dev/null
++++ b/beacon-chain/core/altair/experiment_reward_logging.go
+@@ -0,0 +1,112 @@
++package altair
++
++import (
++	"encoding/csv"
++	"os"
++
++	"github.com/OffchainLabs/prysm/v7/io/file"
++	"path/filepath"
++	"strconv"
++	"sync"
++
++	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/epoch/precompute"
++	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/time"
++	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
++	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
++	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
++)
++
++const experimentRewardCSVPath = "/tmp/prysm-rewards.csv"
++
++var experimentRewardStartupLogOnce sync.Once
++
++// EXPERIMENT: per-validator source/target/head reward logging.
++// Local devnet only. This logs previous-epoch attestation reward components from
++// the Altair-style reward precompute path used by Altair and later forks.
++func writeExperimentRewardCSV(beaconState state.ReadOnlyBeaconState, vals []*precompute.Validator, deltas []*AttDelta) {
++	if os.Getenv("EXPERIMENT_WRITE_REWARDS") != "1" {
++		return
++	}
++
++	if len(vals) != len(deltas) {
++		log.WithFields(map[string]any{
++			"validators": len(vals),
++			"deltas":     len(deltas),
++		}).Error("EXPERIMENT: reward CSV skipped because validator and delta lengths differ")
++		return
++	}
++
++	totalValidators := uint64(beaconState.NumValidators())
++	experimentRewardStartupLogOnce.Do(func() {
++		log.Info(experiment.StartupLog(totalValidators))
++	})
++
++	if err := file.MkdirAll(filepath.Dir(experimentRewardCSVPath)); err != nil {
++		log.WithError(err).Error("EXPERIMENT: could not create reward CSV directory")
++		return
++	}
++
++	info, statErr := os.Stat(experimentRewardCSVPath)
++	newFile := os.IsNotExist(statErr) || (statErr == nil && info.Size() == 0)
++	f, err := os.OpenFile(experimentRewardCSVPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
++	if err != nil {
++		log.WithError(err).Error("EXPERIMENT: could not open reward CSV")
++		return
++	}
++	defer func() {
++		if err := f.Close(); err != nil {
++			log.WithError(err).Error("EXPERIMENT: could not close reward CSV")
++		}
++	}()
++
++	if newFile {
++		log.WithField("path", experimentRewardCSVPath).Info("EXPERIMENT: reward CSV created/opened")
++	} else {
++		log.WithField("path", experimentRewardCSVPath).Info("EXPERIMENT: reward CSV opened")
++	}
++
++	w := csv.NewWriter(f)
++	if newFile {
++		if err := w.Write([]string{"epoch", "validator_index", "is_malicious", "malicious_fraction", "source_reward", "target_reward", "head_reward", "total_reward"}); err != nil {
++			log.WithError(err).Error("EXPERIMENT: could not write reward CSV header")
++			return
++		}
++	}
++
++	epoch := time.PrevEpoch(beaconState)
++	rows := 0
++	for i, val := range vals {
++		if !val.IsActivePrevEpoch {
++			continue
++		}
++		idx := primitives.ValidatorIndex(i)
++		delta := deltas[i]
++		total := delta.SourceReward + delta.TargetReward + delta.HeadReward
++		if err := w.Write([]string{
++			strconv.FormatUint(uint64(epoch), 10),
++			strconv.FormatUint(uint64(idx), 10),
++			strconv.FormatBool(experiment.IsMaliciousValidator(uint64(idx), 0)),
++			experiment.MaliciousFractionString(),
++			strconv.FormatUint(delta.SourceReward, 10),
++			strconv.FormatUint(delta.TargetReward, 10),
++			strconv.FormatUint(delta.HeadReward, 10),
++			strconv.FormatUint(total, 10),
++		}); err != nil {
++			log.WithError(err).Error("EXPERIMENT: could not write reward CSV row")
++			return
++		}
++		rows++
++	}
++
++	w.Flush()
++	if err := w.Error(); err != nil {
++		log.WithError(err).Error("EXPERIMENT: could not flush reward CSV")
++		return
++	}
++
++	log.WithFields(map[string]any{
++		"path":  experimentRewardCSVPath,
++		"epoch": epoch,
++		"rows":  rows,
++	}).Info("EXPERIMENT: epoch rewards written")
++}
+diff --git a/beacon-chain/rpc/prysm/v1alpha1/validator/BUILD.bazel b/beacon-chain/rpc/prysm/v1alpha1/validator/BUILD.bazel
+index 3d9d91ff6f..38af8ed67a 100644
+--- a/beacon-chain/rpc/prysm/v1alpha1/validator/BUILD.bazel
++++ b/beacon-chain/rpc/prysm/v1alpha1/validator/BUILD.bazel
+@@ -43,6 +43,7 @@ go_library(
+     importpath = "github.com/OffchainLabs/prysm/v7/beacon-chain/rpc/prysm/v1alpha1/validator",
+     visibility = ["//beacon-chain:__subpackages__"],
+     deps = [
++        "//runtime/experiment:go_default_library",
+         "//api/client/builder:go_default_library",
+         "//async/event:go_default_library",
+         "//beacon-chain/blockchain:go_default_library",
+diff --git a/beacon-chain/rpc/prysm/v1alpha1/validator/proposer.go b/beacon-chain/rpc/prysm/v1alpha1/validator/proposer.go
+index 8d7f41b34d..bac118c29c 100644
+--- a/beacon-chain/rpc/prysm/v1alpha1/validator/proposer.go
++++ b/beacon-chain/rpc/prysm/v1alpha1/validator/proposer.go
+@@ -27,6 +27,7 @@ import (
+ 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
+ 	enginev1 "github.com/OffchainLabs/prysm/v7/proto/engine/v1"
+ 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
++	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
+ 	"github.com/OffchainLabs/prysm/v7/runtime/version"
+ 	"github.com/OffchainLabs/prysm/v7/time/slots"
+ 	"github.com/ethereum/go-ethereum/common"
+@@ -473,7 +474,44 @@ func (vs *Server) handleUnblindedBlock(
+ 
+ // broadcastReceiveBlock broadcasts a block and handles its reception.
+ func (vs *Server) broadcastReceiveBlock(ctx context.Context, wg *sync.WaitGroup, block interfaces.SignedBeaconBlock, root [fieldparams.RootLength]byte) error {
+-	if err := vs.broadcastBlock(ctx, wg, block, root); err != nil {
++	defer wg.Done()
++
++	slot := block.Block().Slot()
++	proposerIndex := uint64(block.Block().ProposerIndex())
++	attackActive := uint64(slots.ToEpoch(slot)) >= experiment.ExperimentAttackStartEpoch
++	maliciousProposer := experiment.IsMaliciousValidator(proposerIndex, 0)
++
++	if false && maliciousProposer && attackActive {
++		// EXPERIMENT: Byzantine proposer releases block to its own beacon node first.
++		// This updates local fork choice before the block is broadcast to peers.
++		if err := vs.BlockReceiver.ReceiveBlock(ctx, block, root, nil); err != nil {
++			return errors.Wrap(err, "receive block")
++		}
++
++		vs.BlockNotifier.BlockFeed().Send(&feed.Event{
++			Type: blockfeed.ReceivedBlock,
++			Data: &blockfeed.ReceivedBlockData{SignedBlock: block},
++		})
++
++		log.Infof("[ATTACK] Beacon-side release done; delaying block broadcast: slot=%d proposer_index=%d delay=%s", slot, proposerIndex, experiment.ExperimentDelay)
++
++		time.Sleep(experiment.ExperimentDelay)
++
++		broadcastCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++
++		if err := vs.broadcastBlock(broadcastCtx, block, root); err != nil {
++			log.WithError(err).Errorf("[ATTACK] Delayed block broadcast failed: slot=%d proposer_index=%d", slot, proposerIndex)
++			return errors.Wrap(err, "broadcast block")
++		}
++
++		log.Infof("[ATTACK] Delayed block broadcast succeeded: slot=%d proposer_index=%d", slot, proposerIndex)
++
++		return nil
++	}
++
++	// Default Prysm behavior for honest proposers: broadcast first, then receive locally.
++	if err := vs.broadcastBlock(ctx, block, root); err != nil {
+ 		return errors.Wrap(err, "broadcast block")
+ 	}
+ 
+@@ -489,20 +527,19 @@ func (vs *Server) broadcastReceiveBlock(ctx context.Context, wg *sync.WaitGroup,
+ 	return nil
+ }
+ 
+-func (vs *Server) broadcastBlock(ctx context.Context, wg *sync.WaitGroup, block interfaces.SignedBeaconBlock, root [fieldparams.RootLength]byte) error {
+-	defer wg.Done()
+-
++func (vs *Server) broadcastBlock(ctx context.Context, block interfaces.SignedBeaconBlock, root [fieldparams.RootLength]byte) error {
+ 	protoBlock, err := block.Proto()
+ 	if err != nil {
+-		return errors.Wrap(err, "protobuf conversion failed")
++		return errors.Wrap(err, "block proto")
+ 	}
++
+ 	if err := vs.P2P.Broadcast(ctx, protoBlock); err != nil {
+-		return errors.Wrap(err, "broadcast failed")
++		return errors.Wrap(err, "p2p broadcast")
+ 	}
+ 
+ 	log.WithFields(logrus.Fields{
+-		"slot": block.Block().Slot(),
+-		"root": fmt.Sprintf("%#x", root),
++		"blockRoot": fmt.Sprintf("%#x", root),
++		"slot":      block.Block().Slot(),
+ 	}).Debug("Broadcasted block")
+ 
+ 	return nil
+diff --git a/runtime/experiment/BUILD.bazel b/runtime/experiment/BUILD.bazel
+new file mode 100644
+index 0000000000..a614c5a915
+--- /dev/null
++++ b/runtime/experiment/BUILD.bazel
+@@ -0,0 +1,9 @@
++load("@prysm//tools/go:def.bzl", "go_library")
++
++go_library(
++    name = "go_default_library",
++    srcs = ["attack.go",
++        "groups.go"],
++    importpath = "github.com/OffchainLabs/prysm/v7/runtime/experiment",
++    visibility = ["//visibility:public"],
++)
+diff --git a/runtime/experiment/attack.go b/runtime/experiment/attack.go
+new file mode 100644
+index 0000000000..852afe6052
+--- /dev/null
++++ b/runtime/experiment/attack.go
+@@ -0,0 +1,73 @@
++package experiment
++
++import (
++	"fmt"
++	"math"
++	"os"
++	"strconv"
++	"time"
++)
++
++const (
++	// EXPERIMENT: proposer delay attack hook. Local devnet only.
++	ExperimentDelay = 4 * time.Second
++
++	// ExperimentAttackStartEpoch controls when proposer-delay attack starts.
++	// Epochs before this are treated as normal baseline epochs.
++	ExperimentAttackStartEpoch = uint64(2)
++
++	// Experiment settings. Change this single value between experiment runs.
++	ExperimentMaliciousFraction = 0.333
++)
++
++// MaliciousValidatorCut returns floor(totalValidators * ExperimentMaliciousFraction).
++func MaliciousValidatorCut(totalValidators uint64) uint64 {
++	if count, ok := MaliciousValidatorCountFromFile(); ok {
++		return count
++	}
++	return uint64(math.Floor(float64(totalValidators) * ExperimentMaliciousFraction))
++}
++
++func IsMaliciousValidator(validatorIndex uint64, totalValidators uint64) bool {
++	if configured, isMalicious := IsMaliciousValidatorFromFile(validatorIndex); configured {
++		return isMalicious
++	}
++
++	if totalValidators == 0 {
++		totalValidators = 1000
++	}
++
++	return validatorIndex < MaliciousValidatorCut(totalValidators)
++}
++
++func ShouldRunValidatorDuty(validatorIndex uint64) bool {
++	role := os.Getenv("EXPERIMENT_VALIDATOR_ROLE")
++
++	switch role {
++	case "", "all":
++		return true
++	case "honest":
++		return !IsMaliciousValidator(validatorIndex, 0)
++	case "byzantine":
++		return IsMaliciousValidator(validatorIndex, 0)
++	default:
++		return true
++	}
++}
++
++func MaliciousFractionString() string {
++	if fraction, ok := MaliciousFractionStringFromFile(); ok {
++		return fraction
++	}
++	return strconv.FormatFloat(ExperimentMaliciousFraction, 'f', -1, 64)
++}
++
++func StartupLog(totalValidators uint64) string {
++	return fmt.Sprintf(
++		"[EXPERIMENT]\nvalidators=%d\nmalicious_fraction=%s\nmalicious_validators=%d\ndelay=%s",
++		totalValidators,
++		MaliciousFractionString(),
++		MaliciousValidatorCut(totalValidators),
++		ExperimentDelay,
++	)
++}
+diff --git a/runtime/experiment/groups.go b/runtime/experiment/groups.go
+new file mode 100644
+index 0000000000..cba0cd0b80
+--- /dev/null
++++ b/runtime/experiment/groups.go
+@@ -0,0 +1,166 @@
++package experiment
++
++import (
++	"bufio"
++	"fmt"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
++)
++
++var maliciousGroupOnce sync.Once
++var maliciousGroupConfigured bool
++var maliciousGroupSet map[uint64]struct{}
++var maliciousGroupCount uint64
++
++func maliciousValidatorsFilePath() string {
++	return strings.TrimSpace(os.Getenv("EXPERIMENT_MALICIOUS_VALIDATORS_FILE"))
++}
++
++func failGroupLoad(format string, args ...any) {
++	_, _ = fmt.Fprintf(os.Stderr, "[EXPERIMENT] "+format+"\n", args...)
++	os.Exit(1)
++}
++
++func loadMaliciousGroup() {
++	path := maliciousValidatorsFilePath()
++	if path == "" {
++		return
++	}
++
++	maliciousGroupConfigured = true
++	maliciousGroupSet = make(map[uint64]struct{})
++
++	f, err := os.Open(path)
++	if err != nil {
++		failGroupLoad("failed to open EXPERIMENT_MALICIOUS_VALIDATORS_FILE=%s: %v", path, err)
++	}
++
++	scanner := bufio.NewScanner(f)
++	lineNo := 0
++
++	for scanner.Scan() {
++		lineNo++
++		line := scanner.Text()
++
++		if idx := strings.Index(line, "#"); idx >= 0 {
++			line = line[:idx]
++		}
++
++		line = strings.ReplaceAll(line, ",", " ")
++		line = strings.TrimSpace(line)
++		if line == "" {
++			continue
++		}
++
++		for tok := range strings.FieldsSeq(line) {
++			if err := addMaliciousValidatorToken(tok, maliciousGroupSet); err != nil {
++				failGroupLoad("invalid validator token %q at %s:%d: %v", tok, path, lineNo, err)
++			}
++		}
++	}
++
++	if err := scanner.Err(); err != nil {
++		failGroupLoad("failed to read malicious validator file %s: %v", path, err)
++	}
++
++	if err := f.Close(); err != nil {
++		failGroupLoad("failed to close malicious validator file %s: %v", path, err)
++	}
++
++	maliciousGroupCount = uint64(len(maliciousGroupSet))
++}
++
++func addMaliciousValidatorToken(tok string, set map[uint64]struct{}) error {
++	tok = strings.TrimSpace(tok)
++	if tok == "" {
++		return nil
++	}
++
++	if strings.Contains(tok, "..") {
++		parts := strings.SplitN(tok, "..", 2)
++		return addMaliciousValidatorRange(parts[0], parts[1], set)
++	}
++
++	if strings.Contains(tok, "-") {
++		parts := strings.SplitN(tok, "-", 2)
++		return addMaliciousValidatorRange(parts[0], parts[1], set)
++	}
++
++	v, err := strconv.ParseUint(tok, 10, 64)
++	if err != nil {
++		return err
++	}
++
++	set[v] = struct{}{}
++	return nil
++}
++
++func addMaliciousValidatorRange(startStr string, endStr string, set map[uint64]struct{}) error {
++	start, err := strconv.ParseUint(strings.TrimSpace(startStr), 10, 64)
++	if err != nil {
++		return err
++	}
++
++	end, err := strconv.ParseUint(strings.TrimSpace(endStr), 10, 64)
++	if err != nil {
++		return err
++	}
++
++	if end < start {
++		return fmt.Errorf("range end %d is smaller than start %d", end, start)
++	}
++
++	for i := start; i <= end; i++ {
++		set[i] = struct{}{}
++		if i == ^uint64(0) {
++			break
++		}
++	}
++
++	return nil
++}
++
++func IsMaliciousValidatorFromFile(validatorIndex uint64) (bool, bool) {
++	maliciousGroupOnce.Do(loadMaliciousGroup)
++
++	if !maliciousGroupConfigured {
++		return false, false
++	}
++
++	_, ok := maliciousGroupSet[validatorIndex]
++	return true, ok
++}
++
++func MaliciousValidatorCountFromFile() (uint64, bool) {
++	maliciousGroupOnce.Do(loadMaliciousGroup)
++
++	if !maliciousGroupConfigured {
++		return 0, false
++	}
++
++	return maliciousGroupCount, true
++}
++
++func MaliciousFractionStringFromFile() (string, bool) {
++	count, ok := MaliciousValidatorCountFromFile()
++	if !ok {
++		return "", false
++	}
++
++	totalValidators := uint64(1000)
++	if raw := strings.TrimSpace(os.Getenv("EXPERIMENT_TOTAL_VALIDATORS")); raw != "" {
++		v, err := strconv.ParseUint(raw, 10, 64)
++		if err != nil {
++			failGroupLoad("invalid EXPERIMENT_TOTAL_VALIDATORS=%q: %v", raw, err)
++		}
++		totalValidators = v
++	}
++
++	if totalValidators == 0 {
++		return "", false
++	}
++
++	return strconv.FormatFloat(float64(count)/float64(totalValidators), 'f', -1, 64), true
++}
+diff --git a/validator/client/BUILD.bazel b/validator/client/BUILD.bazel
+index 2971391c35..ed5cb7c444 100644
+--- a/validator/client/BUILD.bazel
++++ b/validator/client/BUILD.bazel
+@@ -3,6 +3,7 @@ load("@prysm//tools/go:def.bzl", "go_library", "go_test")
+ go_library(
+     name = "go_default_library",
+     srcs = [
++        "experiment_private_blocks.go",
+         "aggregate.go",
+         "aggregator_selector.go",
+         "attest.go",
+@@ -50,6 +51,7 @@ go_library(
+         "//consensus-types/blocks:go_default_library",
+         "//consensus-types/interfaces:go_default_library",
+         "//consensus-types/primitives:go_default_library",
++        "//consensus-types/validator:go_default_library",
+         "//crypto/bls:go_default_library",
+         "//crypto/hash:go_default_library",
+         "//crypto/rand:go_default_library",
+@@ -59,6 +61,7 @@ go_library(
+         "//network/httputil:go_default_library",
+         "//proto/prysm/v1alpha1:go_default_library",
+         "//proto/prysm/v1alpha1/validator-client:go_default_library",
++        "//runtime/experiment:go_default_library",
+         "//runtime/version:go_default_library",
+         "//time:go_default_library",
+         "//time/slots:go_default_library",
+diff --git a/validator/client/attest.go b/validator/client/attest.go
+index d69f7e224d..7276755533 100644
+--- a/validator/client/attest.go
++++ b/validator/client/attest.go
+@@ -3,6 +3,7 @@ package client
+ import (
+ 	"context"
+ 	"fmt"
++	"slices"
+ 	"strings"
+ 	"time"
+ 
+@@ -18,11 +19,13 @@ import (
+ 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
+ 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+ 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
++	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
+ 	prysmTime "github.com/OffchainLabs/prysm/v7/time"
+ 	"github.com/OffchainLabs/prysm/v7/time/slots"
+ 	"github.com/OffchainLabs/prysm/v7/validator/client/iface"
+ 	"github.com/pkg/errors"
+ 	"github.com/sirupsen/logrus"
++	"google.golang.org/protobuf/proto"
+ )
+ 
+ var failedAttLocalProtectionErr = "attempted to make slashable attestation, rejected by local slashing protection"
+@@ -70,6 +73,10 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
+ 		return
+ 	}
+ 
++	if !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
++		return
++	}
++
+ 	postElectra := slots.ToEpoch(slot) >= params.BeaconConfig().ElectraForkEpoch
+ 
+ 	data, err := v.getAttestationData(ctx, slot, duty.CommitteeIndex)
+@@ -82,6 +89,23 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
+ 		return
+ 	}
+ 
++	usedPrivateHead := false
++	privateHeadReleaseTime := time.Time{}
++	if experimentIsByzantineRole() {
++		if privateRoot, releaseTime, ok := experimentLookupPrivateBlock(slot); ok {
++			cloned, ok := proto.Clone(data).(*ethpb.AttestationData)
++			if ok {
++				data = cloned
++			}
++			oldRoot := slices.Clone(data.BeaconBlockRoot)
++			data.BeaconBlockRoot = slices.Clone(privateRoot[:])
++			usedPrivateHead = true
++			privateHeadReleaseTime = releaseTime
++			log.Infof("[EXPERIMENT] Byzantine attester using private head before signing: slot=%d validator_index=%d old_head=%#x private_head=%#x release_unix_millis=%d",
++				slot, duty.ValidatorIndex, oldRoot, privateRoot, releaseTime.UnixMilli())
++		}
++	}
++
+ 	sig, _, err := v.signAtt(ctx, pubKey, data, slot)
+ 	if err != nil {
+ 		log.WithError(err).Error("Could not sign attestation")
+@@ -127,6 +151,28 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
+ 		return
+ 	}
+ 
++	if usedPrivateHead {
++		waitUntil := privateHeadReleaseTime.Add(500 * time.Millisecond)
++		if wait := time.Until(waitUntil); wait > 0 {
++			log.Infof("[EXPERIMENT] Byzantine attester waiting for public block release before submit: slot=%d validator_index=%d wait=%s release_unix_millis=%d",
++				slot, duty.ValidatorIndex, wait, privateHeadReleaseTime.UnixMilli())
++			timer := time.NewTimer(wait)
++			select {
++			case <-timer.C:
++			case <-ctx.Done():
++				if !timer.Stop() {
++					select {
++					case <-timer.C:
++					default:
++					}
++				}
++				log.WithError(ctx.Err()).Error("Context canceled before submitting private-head attestation")
++				tracing.AnnotateError(span, ctx.Err())
++				return
++			}
++		}
++	}
++
+ 	var aggregationBitfield bitfield.Bitlist
+ 	var attestation ethpb.Att
+ 	var attResp *ethpb.AttestResponse
+diff --git a/validator/client/experiment_private_blocks.go b/validator/client/experiment_private_blocks.go
+new file mode 100644
+index 0000000000..785001904e
+--- /dev/null
++++ b/validator/client/experiment_private_blocks.go
+@@ -0,0 +1,124 @@
++package client
++
++import (
++	"bufio"
++	"fmt"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
++	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
++	"github.com/ethereum/go-ethereum/common/hexutil"
++)
++
++var experimentPrivateBlockFileLock sync.Mutex
++
++func experimentIsByzantineRole() bool {
++	role := strings.ToLower(strings.TrimSpace(os.Getenv("EXPERIMENT_VALIDATOR_ROLE")))
++	return role == "byzantine" || role == "byz" || role == "malicious"
++}
++
++func experimentPrivateBlocksPath() string {
++	if p := strings.TrimSpace(os.Getenv("EXPERIMENT_PRIVATE_BLOCKS_PATH")); p != "" {
++		return p
++	}
++	return "/tmp/prysm-private-blocks.csv"
++}
++
++func experimentRecordPrivateBlock(slot primitives.Slot, root [fieldparams.RootLength]byte, releaseTime time.Time) error {
++	experimentPrivateBlockFileLock.Lock()
++	defer experimentPrivateBlockFileLock.Unlock()
++
++	f, err := os.OpenFile(experimentPrivateBlocksPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
++	if err != nil {
++		return err
++	}
++
++	needHeader := false
++	if st, statErr := f.Stat(); statErr != nil {
++		if closeErr := f.Close(); closeErr != nil {
++			return closeErr
++		}
++		return statErr
++	} else if st.Size() == 0 {
++		needHeader = true
++	}
++
++	if needHeader {
++		if _, err := fmt.Fprintln(f, "slot,block_root,release_unix_millis"); err != nil {
++			if closeErr := f.Close(); closeErr != nil {
++				return closeErr
++			}
++			return err
++		}
++	}
++
++	_, err = fmt.Fprintf(f, "%d,%s,%d\n", uint64(slot), hexutil.Encode(root[:]), releaseTime.UnixMilli())
++	if closeErr := f.Close(); closeErr != nil && err == nil {
++		err = closeErr
++	}
++	return err
++}
++
++func experimentLookupPrivateBlock(slot primitives.Slot) ([fieldparams.RootLength]byte, time.Time, bool) {
++	var root [fieldparams.RootLength]byte
++
++	experimentPrivateBlockFileLock.Lock()
++	defer experimentPrivateBlockFileLock.Unlock()
++
++	f, err := os.Open(experimentPrivateBlocksPath())
++	if err != nil {
++		return root, time.Time{}, false
++	}
++
++	var foundRoot [fieldparams.RootLength]byte
++	var foundRelease time.Time
++	found := false
++
++	scanner := bufio.NewScanner(f)
++	for scanner.Scan() {
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" || strings.HasPrefix(line, "slot,") {
++			continue
++		}
++		parts := strings.Split(line, ",")
++		if len(parts) < 3 {
++			continue
++		}
++
++		s, err := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 64)
++		if err != nil || primitives.Slot(s) != slot {
++			continue
++		}
++
++		decoded, err := hexutil.Decode(strings.TrimSpace(parts[1]))
++		if err != nil || len(decoded) != fieldparams.RootLength {
++			continue
++		}
++
++		ms, err := strconv.ParseInt(strings.TrimSpace(parts[2]), 10, 64)
++		if err != nil {
++			continue
++		}
++
++		copy(foundRoot[:], decoded)
++		foundRelease = time.UnixMilli(ms)
++		found = true
++	}
++
++	if err := scanner.Err(); err != nil {
++		if closeErr := f.Close(); closeErr != nil {
++			return root, time.Time{}, false
++		}
++		return root, time.Time{}, false
++	}
++
++	if err := f.Close(); err != nil {
++		return root, time.Time{}, false
++	}
++
++	return foundRoot, foundRelease, found
++}
+diff --git a/validator/client/propose.go b/validator/client/propose.go
+index 23713fd968..3cb07cf334 100644
+--- a/validator/client/propose.go
++++ b/validator/client/propose.go
+@@ -4,6 +4,7 @@ package client
+ import (
+ 	"context"
+ 	"fmt"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/OffchainLabs/prysm/v7/async"
+@@ -14,12 +15,14 @@ import (
+ 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
+ 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
+ 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
++	vtypes "github.com/OffchainLabs/prysm/v7/consensus-types/validator"
+ 	"github.com/OffchainLabs/prysm/v7/crypto/bls"
+ 	"github.com/OffchainLabs/prysm/v7/crypto/rand"
+ 	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
+ 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
+ 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+ 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
++	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
+ 	"github.com/OffchainLabs/prysm/v7/runtime/version"
+ 	"github.com/OffchainLabs/prysm/v7/time/slots"
+ 	"github.com/OffchainLabs/prysm/v7/validator/client/iface"
+@@ -37,6 +40,8 @@ const (
+ 	failedBlockSignLocalErr = "block rejected by local protection"
+ )
+ 
++var experimentStartupLogOnce sync.Once
++
+ // ProposeBlock proposes a new beacon block for a given slot. This method collects the
+ // previous beacon block, any pending deposits, and ETH1 data from the beacon
+ // chain node to construct the new block. The new block is then processed with
+@@ -58,6 +63,20 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
+ 	span.SetAttributes(trace.StringAttribute("validator", fmtKey))
+ 	log := log.WithField("pubkey", fmt.Sprintf("%#x", bytesutil.Trunc(pubKey[:])))
+ 
++	// EXPERIMENT: role filter before requesting/building a block.
++	proposerDuty, err := v.duty(pubKey)
++	if err != nil {
++		log.WithError(err).Error("EXPERIMENT: could not fetch validator assignment for proposer role filter")
++		if v.emitAccountMetrics {
++			ValidatorProposeFailVec.WithLabelValues(fmtKey).Inc()
++		}
++		return
++	}
++	if !experiment.ShouldRunValidatorDuty(uint64(proposerDuty.ValidatorIndex)) {
++		log.Infof("[EXPERIMENT] Skipping proposer duty before block build due to role filter: slot=%d validator_index=%d", slot, proposerDuty.ValidatorIndex)
++		return
++	}
++
+ 	// Sign randao reveal, it's used to request block from beacon node
+ 	epoch := primitives.Epoch(slot / params.BeaconConfig().SlotsPerEpoch)
+ 	randaoReveal, err := v.signRandaoReveal(ctx, pubKey, epoch, slot)
+@@ -168,6 +187,53 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
+ 		}
+ 	}
+ 
++	proposerIndex := blk.Block().ProposerIndex()
++	if !experiment.ShouldRunValidatorDuty(uint64(proposerIndex)) {
++		log.Infof("[EXPERIMENT] Skipping proposer duty due to role filter: slot=%d validator_index=%d", slot, proposerIndex)
++		return
++	}
++	// EXPERIMENT: proposer delay attack hook. Local devnet only.
++	totalValidators, err := v.experimentTotalValidators(ctx)
++	if err != nil {
++		log.WithError(err).Error("EXPERIMENT: could not determine validator count for proposer delay hook")
++	} else {
++		experimentStartupLogOnce.Do(func() {
++			log.Info(experiment.StartupLog(totalValidators))
++		})
++	}
++
++	if experimentIsByzantineRole() &&
++		experiment.IsMaliciousValidator(uint64(proposerIndex), 0) &&
++		uint64(slots.ToEpoch(slot)) >= experiment.ExperimentAttackStartEpoch {
++		blockRoot, rootErr := blk.Block().HashTreeRoot()
++		if rootErr != nil {
++			log.WithError(rootErr).Errorf("[EXPERIMENT] Could not compute private block root: slot=%d proposer_index=%d", slot, proposerIndex)
++		} else {
++			releaseTime := time.Now().Add(experiment.ExperimentDelay)
++			if err := experimentRecordPrivateBlock(slot, blockRoot, releaseTime); err != nil {
++				log.WithError(err).Errorf("[EXPERIMENT] Could not record private block: slot=%d proposer_index=%d", slot, proposerIndex)
++			} else {
++				log.Infof("[EXPERIMENT] Byzantine private release recorded: slot=%d proposer_index=%d block_root=%#x delay=%s release_unix_millis=%d",
++					slot, proposerIndex, blockRoot, experiment.ExperimentDelay, releaseTime.UnixMilli())
++			}
++		}
++
++		timer := time.NewTimer(experiment.ExperimentDelay)
++		select {
++		case <-timer.C:
++		case <-ctx.Done():
++			if !timer.Stop() {
++				select {
++				case <-timer.C:
++				default:
++				}
++			}
++			log.WithError(ctx.Err()).Errorf("[EXPERIMENT] Context canceled before delayed block submit: slot=%d proposer_index=%d", slot, proposerIndex)
++			return
++		}
++		log.Infof("[EXPERIMENT] Byzantine proposer submitting delayed block: slot=%d proposer_index=%d delay=%s", slot, proposerIndex, experiment.ExperimentDelay)
++	}
++
+ 	blkResp, err := v.validatorClient.ProposeBeaconBlock(ctx, genericSignedBlock)
+ 	if err != nil {
+ 		log.WithField("slot", slot).WithError(err).Error("Failed to propose block")
+@@ -197,6 +263,31 @@ func (v *validator) ProposeBlock(ctx context.Context, slot primitives.Slot, pubK
+ 	}
+ }
+ 
++func (v *validator) experimentTotalValidators(ctx context.Context) (uint64, error) {
++	if v.prysmChainClient == nil {
++		return 0, errors.New("prysm chain client is nil")
++	}
++	counts, err := v.prysmChainClient.ValidatorCount(ctx, "", []vtypes.Status{
++		vtypes.PendingInitialized,
++		vtypes.PendingQueued,
++		vtypes.ActiveOngoing,
++		vtypes.ActiveExiting,
++		vtypes.ActiveSlashed,
++		vtypes.ExitedUnslashed,
++		vtypes.ExitedSlashed,
++		vtypes.WithdrawalPossible,
++		vtypes.WithdrawalDone,
++	})
++	if err != nil {
++		return 0, err
++	}
++	var total uint64
++	for _, count := range counts {
++		total += count.Count
++	}
++	return total, nil
++}
++
+ func logProposedBlock(log *logrus.Entry, blk interfaces.SignedBeaconBlock, blkRoot []byte) error {
+ 	if blk.Version() >= version.Bellatrix && blk.Version() < version.Gloas {
+ 		p, err := blk.Block().Body().Execution()
+diff --git a/validator/client/sync_committee.go b/validator/client/sync_committee.go
+index 30124c3d88..621c7e4618 100644
+--- a/validator/client/sync_committee.go
++++ b/validator/client/sync_committee.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
+ 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+ 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
++	"github.com/OffchainLabs/prysm/v7/runtime/experiment"
+ 	"github.com/OffchainLabs/prysm/v7/time/slots"
+ 	"github.com/ethereum/go-ethereum/common/hexutil"
+ 	emptypb "github.com/golang/protobuf/ptypes/empty"
+@@ -29,16 +30,19 @@ func (v *validator) SubmitSyncCommitteeMessage(ctx context.Context, slot primiti
+ 
+ 	v.waitUntilAttestationDueOrValidBlock(ctx, slot)
+ 
+-	res, err := v.validatorClient.SyncMessageBlockRoot(ctx, &emptypb.Empty{})
++	duty, err := v.duty(pubKey)
+ 	if err != nil {
+-		log.WithError(err).Error("Could not request sync message block root to sign")
+-		tracing.AnnotateError(span, err)
++		log.WithError(err).Error("Could not fetch validator assignment")
++		return
++	}
++	if !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
+ 		return
+ 	}
+ 
+-	duty, err := v.duty(pubKey)
++	res, err := v.validatorClient.SyncMessageBlockRoot(ctx, &emptypb.Empty{})
+ 	if err != nil {
+-		log.WithError(err).Error("Could not fetch validator assignment")
++		log.WithError(err).Error("Could not request sync message block root to sign")
++		tracing.AnnotateError(span, err)
+ 		return
+ 	}
+ 
+@@ -105,6 +109,9 @@ func (v *validator) SubmitSignedContributionAndProof(ctx context.Context, slot p
+ 		log.WithError(err).Error("Could not fetch validator assignment")
+ 		return
+ 	}
++	if !experiment.ShouldRunValidatorDuty(uint64(duty.ValidatorIndex)) {
++		return
++	}
+ 
+ 	indexRes, err := v.validatorClient.SyncSubcommitteeIndex(ctx, &ethpb.SyncSubcommitteeIndexRequest{
+ 		PublicKey: pubKey[:],
