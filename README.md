@@ -1,58 +1,66 @@
 # Ethereum PoS Incentive and Fork-Choice Attack Experiments
 
-This repository contains our experimental implementation and evaluation of
-incentive and fork-choice attacks in Ethereum Proof-of-Stake.
+This repository contains the experimental implementation and reproduction artifacts for incentive and fork-choice attacks in Ethereum Proof-of-Stake.
 
 The experiments are implemented by extending the Prysm Ethereum consensus client.
 
 ## Repository Structure
 
-### Baseline
-
-`baseline/prysm`
-
-Prysm baseline used in our experiments.
-
 ### Attack Experiments
 
-- `attack/delay-4s`  
+- `experiments/delay-4s/`  
   4-second proposer block-delay attack.
 
-- `attack/reorg-k2`  
-  Reorganization attack with \(k=2\).
-
-- `attack/reorg-k3`  
-  Reorganization attack with \(k=3\).
-
-- `attack/reorg-k4`  
-  Reorganization attack with \(k=4\).
+- `experiments/reorg/`  
+  Reorganization attacks with `k = 2`, `k = 3`, and `k = 4`, together with a no-attack control.
 
 ### Mitigation Experiments
 
-- `mitigation/delay-4s`
-- `mitigation/reorg-k2`
-- `mitigation/reorg-k3`
-- `mitigation/reorg-k4`
+- `mitigation/delay-4s/`  
+  Delay attack with the mitigation mechanism enabled.
 
-These branches contain the corresponding experiments with our mitigation mechanism enabled.
-
-### Reproducible Artifact
-
-`artifact/delay-4s-mitigation`
-
-This branch provides a complete runnable experiment, including:
-
-- experiment configuration
-- beacon chain startup
-- validator startup
-- attack / mitigation setup
-- reward data collection
-- reproduction instructions
-
-## Experimental Platform
-
-The experiments run on a local Ethereum Proof-of-Stake devnet based on Prysm.
+- `mitigation/reorg/`  
+  Reorganization attacks with `k = 2`, `k = 3`, and `k = 4` with the mitigation mechanism enabled.
 
 ## Reproduction
 
-Please refer to the README file in each experiment branch for experiment-specific setup and execution instructions.
+All experiments can be launched directly from the repository root.
+
+### Delay Attack
+
+```bash
+bash experiments/delay-4s/run.sh
+```
+
+### Delay Attack with Mitigation
+
+```bash
+bash mitigation/delay-4s/run.sh
+```
+
+### Reorganization Attacks
+
+```bash
+bash experiments/reorg/scripts/run.sh k2
+bash experiments/reorg/scripts/run.sh k3
+bash experiments/reorg/scripts/run.sh k4
+```
+
+No-attack control:
+
+```bash
+bash experiments/reorg/scripts/run.sh no-attack
+```
+
+### Reorganization Attacks with Mitigation
+
+```bash
+bash mitigation/reorg/scripts/run.sh k2
+bash mitigation/reorg/scripts/run.sh k3
+bash mitigation/reorg/scripts/run.sh k4
+```
+
+Each launcher automatically prepares the corresponding Prysm baseline, applies the experiment patch, builds Prysm, generates the devnet genesis state, and starts the beacon node and validator clients.
+
+For experiment-specific details, see the README file in the corresponding directory.
+
